@@ -1,16 +1,21 @@
 # kl-zero-stick
 
 WiFi sync and **live roast graphs** for a Kaffelogic Nano 7 with the **older main board** (the one with a USB-A
-port that only takes a memory stick), using a Raspberry Pi Zero W plugged into the roaster in place of the stick.
+port that only takes a USB stick), using a Raspberry Pi Zero W plugged into the roaster in place of the stick.
 
 The Pi Zero does two things at once:
 
-1. **To the roaster it is a USB memory stick** (`kl-msc`). The roaster reads profiles from it and writes its roast
+1. **To the roaster it is a USB stick** (`kl-msc`). The roaster reads profiles from it and writes its roast
    logs to it, exactly as it does with a real stick.
 2. **To Kaffelogic Studio it looks like a roaster reachable over WiFi** (`kl-sassi`). Studio syncs logs and
    profiles, shows the roast live while it is happening, and can send a profile to the "roaster" (i.e. onto the stick).
 
 No changes are made to the roaster or to Studio.
+
+<p align="center">
+  <img src="docs/img/case-on-roaster.jpg" width="45%" alt="The Pi Zero in its printed case, plugged into the roaster's USB-A port">
+  <img src="docs/img/case-side.jpg" width="45%" alt="The case from the side: only the metal part of the USB-A plug sticks out">
+</p>
 
 > **Unofficial and unsupported.** This project is not affiliated with or endorsed by Kaffelogic. It has been used
 > on exactly one roaster (model KN1007B, firmware 7.22.1) for a short time. It writes to the storage your
@@ -27,6 +32,17 @@ No changes are made to the roaster or to Studio.
 | Sending a profile from Studio to the stick | works, **off by default** (`KL_WRITE=0`) |
 | Recording the real date/time of each roast (the roaster has no clock) | works |
 | Roaster preferences / commands from Studio | **not possible** on this board (see Limitations) |
+
+A finished roast as Studio shows it after the live view ends (roast and cooling, synced over WiFi):
+
+![Studio: final log after a live roast](docs/img/studio-log.png)
+
+Studio's *View roaster → Wifi Module* tab with the Pi connected. `kl-sassi` answers with fixed values: module
+firmware `9.9.9` (newer than any release, so Studio considers it up to date) and a signal of `-50 dBm` (not a real
+measurement). Do not use the *Install* links there: they are meant for the official module and have not been tried
+with `kl-sassi`.
+
+![Studio: Wifi Module tab](docs/img/studio-wifi-module.png)
 
 ## Why this exists
 
@@ -75,7 +91,7 @@ Protocol notes are in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 - Raspberry Pi Zero W (v1.1) and a microSD card
 - A short USB-A male → micro-USB data cable, plugged into the Pi's **USB** port (not PWR)
-- The original Kaffelogic memory stick (to clone)
+- The original Kaffelogic USB stick (to clone)
 
 ### Case
 

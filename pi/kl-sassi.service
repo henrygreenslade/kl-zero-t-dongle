@@ -1,0 +1,18 @@
+[Unit]
+Description=Kaffelogic SASSI server - the Pi Zero as a "WiFi module" for Studio (TCP 9056)
+After=network-online.target kl-msc.service kl-data.service
+Wants=network-online.target
+Requires=kl-data.service
+
+[Service]
+# KL_WRITE=1 allows profile uploads / deletions inside the stick image (stop kl-msc -> mount -> start).
+# Leave it at 0 until reading works reliably for you.
+Environment=KL_WRITE=0
+# with a read-only root /var/log lives in RAM; the server log stays on the card (data directory)
+Environment=KL_LOG=/var/lib/kl-sassi/kl-sassi.log
+ExecStart=/usr/bin/python3 -I /usr/local/bin/kl-sassi.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

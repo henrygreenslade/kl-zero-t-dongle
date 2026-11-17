@@ -1,0 +1,16 @@
+#!/bin/sh
+# Before the image is handed to the roaster: if the FAT32 volume is flagged "dirty" (byte 0x41 of the boot
+# sector) the Kaffelogic shows "USB error / check device". Check+repair with fsck.fat, otherwise clear the flag.
+IMG=/var/lib/kaffelogic/nano7.img
+d=$(od -An -tu1 -j65 -N1 "$IMG" | tr -d ' ')
+[ "$d" = 0 ] && exit 0
+logger -t kl-fat-clean "dirty=$d - repairing"
+if command -v fsck.fat >/dev/null; then
+  fsck.fat -a -w "$IMG" 2>&1 | logger -t kl-fat-clean
+fi
+d=$(od -An -tu1 -j65 -N1 "$IMG" | tr -d ' ')
+if [ "$d" != 0 ]; then
+  printf '\000' | dd of="$IMG" bs=1 seek=65 conv=notrunc status=none
+  logger -t kl-fat-clean "flag cleared manually"
+fi
+sync

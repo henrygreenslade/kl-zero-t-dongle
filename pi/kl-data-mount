@@ -1,0 +1,12 @@
+#!/bin/sh
+# With overlayroot (read-only root, changes kept in RAM) the DATA must still reach the SD card:
+# the lower (real) root is at /media/root-ro. We remount it rw and bind-mount only the data directories.
+# Without the overlay (normal boot) this does nothing.
+LOWER=/media/root-ro
+mountpoint -q "$LOWER" || exit 0
+mount -o remount,rw,noatime "$LOWER" || exit 1
+for d in /var/lib/kaffelogic /var/lib/kl-sassi /var/lib/systemd/timesync; do
+  mkdir -p "$LOWER$d" "$d"
+  mountpoint -q "$d" || mount --bind "$LOWER$d" "$d" || exit 1
+done
+exit 0

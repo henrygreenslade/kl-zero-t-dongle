@@ -1,0 +1,14 @@
+[Unit]
+Description=Kaffelogic: writable data directories on top of the read-only root (overlayroot)
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=kl-msc.service kl-sassi.service systemd-timesyncd.service sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/kl-data-mount
+
+[Install]
+WantedBy=sysinit.target

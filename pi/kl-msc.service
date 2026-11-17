@@ -1,0 +1,17 @@
+[Unit]
+Description=Kaffelogic USB stick emulation in userspace (with full logging)
+DefaultDependencies=no
+After=systemd-remount-fs.service sys-kernel-config.mount kl-data.service
+Requires=kl-data.service
+RequiresMountsFor=/var/lib/kaffelogic
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+ExecStartPre=/usr/local/bin/kl-fat-clean
+ExecStart=/usr/bin/python3 -I /usr/local/bin/kl-msc.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=sysinit.target

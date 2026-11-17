@@ -149,6 +149,19 @@ root (`overlayroot=tmpfs:recurse=0` on the kernel command line, package `overlay
 bind-mounts the few directories that must stay writable. Without the overlay `kl-data` does nothing. If you enable
 it, switch swap to zram only and journald to volatile storage first.
 
+## Day-to-day use
+
+The Pi is powered by the roaster, so it boots every time you switch the roaster on. On our Pi Zero W:
+
+| After switching the roaster on | |
+|---|---|
+| ~30 s | the roaster sees the stick (profiles available) |
+| ~1.5 min | Studio can connect; it then syncs logs and profiles on its own |
+
+You can start a roast as soon as the profiles appear on the roaster; Studio does not need to be connected. If it
+connects in the middle of a roast, the live view starts from the beginning of that roast. The Pi switches off with
+the roaster; logs written to the stick are kept, and Studio picks up anything it missed the next time it connects.
+
 ## Testing without Studio
 
 `tools/sassi_client.py` behaves like Studio as far as we understand it:

@@ -114,7 +114,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 
   <footer>
     <span>Uploading or deleting briefly unplugs the stick from the roaster; not possible while roasting.</span>
-    <span><a href="/log" target="_blank">Log</a> &middot; <a href="#" id="rebootLink">Reboot</a></span>
+    <span><span id="ver"></span> &middot; <a href="/log" target="_blank">Log</a> &middot; <a href="#" id="rebootLink">Reboot</a></span>
   </footer>
 </div>
 
@@ -149,6 +149,7 @@ function setStat(id, text, sub, dot) {
 
 function refreshStatus() {
   fetch('/status').then(r => r.json()).then(s => {
+    $('ver').textContent = 'KLDongle ' + s.version;
     $('net').textContent = s.ip + ' · ' + s.hostname + ' · ' + s.rssi + ' dBm';
     if (s.live) setStat('sRoaster', 'Roasting', s.live, 'roast');
     else setStat('sRoaster', 'Idle', s.roasterActive ? 'USB host is writing' : '', 'on');

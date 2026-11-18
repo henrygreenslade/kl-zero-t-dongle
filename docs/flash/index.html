@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KLDongle Flasher</title>
+<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
+<style>
+  :root { --accent: #e3681b; --ink: #1d1d1f; --muted: #6e6e73; --line: #e6e6e9; --bg: #111; --panel: #fff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px; background: var(--bg); color: var(--ink);
+         font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; }
+  .wrap { max-width: 640px; margin: 0 auto; background: var(--panel); border-radius: 10px; overflow: hidden; }
+  header { padding: 16px 24px; border-bottom: 3px solid var(--accent); }
+  h1 { margin: 0; font-size: 20px; }
+  header p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+  main { padding: 8px 24px 24px; }
+  ol { padding-left: 20px; }
+  li { margin: 8px 0; }
+  .install { margin: 20px 0; }
+  esp-web-install-button button[slot="activate"] {
+    font: inherit; font-weight: 600; background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+    padding: 10px 22px; cursor: pointer; }
+  .note { color: var(--muted); font-size: 13px; border-top: 1px solid var(--line); padding-top: 12px; }
+  code { background: #f5f5f7; padding: 1px 5px; border-radius: 4px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>KLDongle flasher</h1>
+    <p>Firmware 1.0.0 for the LILYGO T-Dongle-S3 &middot; Kaffelogic Nano 7 (older board)</p>
+  </header>
+  <main>
+    <ol>
+      <li>Use <strong>Chrome or Edge</strong> on a computer (the browser talks to the dongle over USB).</li>
+      <li>Hold the button on the dongle while you plug it into the computer, then let go. It is now in download mode.</li>
+      <li>Click <strong>Install</strong>, choose the port (on a Mac <code>usbmodem&hellip;</code>, on Windows <code>COM&hellip;</code>) and confirm.</li>
+      <li>When it says done, unplug the dongle and plug it in again <em>without</em> the button.</li>
+    </ol>
+    <div class="install">
+      <esp-web-install-button manifest="manifest.json">
+        <button slot="activate">Install</button>
+        <span slot="unsupported">This browser cannot flash devices. Use Chrome or Edge on a desktop computer.</span>
+        <span slot="not-allowed">Flashing needs a secure (https) page.</span>
+      </esp-web-install-button>
+    </div>
+    <p>Then put a FAT32 microSD card with your Kaffelogic files in the dongle and add <code>wifi_config.txt</code>;
+       see the <a href="https://github.com/henrygreenslade/kl-zero-t-dongle/tree/main/t-dongle-s3">README</a>.</p>
+    <p class="note">Your WiFi settings live on the SD card, not in the firmware, so updating never loses them.
+       &ldquo;Erase device&rdquo; on the first install only clears the dongle's own memory (roast start times).
+       Unofficial project, not affiliated with Kaffelogic.</p>
+  </main>
+</div>
+</body>
+</html>

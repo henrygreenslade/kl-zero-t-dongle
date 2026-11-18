@@ -54,6 +54,8 @@ extern "C" {          // same include order as the core's SD library (sd_diskio.
 #include "mbedtls/base64.h"
 #include "webui.h"
 
+#define KLDONGLE_VERSION "1.0.0"
+
 // ------------------------------------------------------------------ T-Dongle-S3 pins
 #define PIN_SD_CLK 12
 #define PIN_SD_CMD 16
@@ -1527,7 +1529,7 @@ void handleStatus() {
   if (!gWriteWin) fatUsage(used, size);
   char b[900];
   snprintf(b, sizeof b,
-           "{\"ip\":\"%s\",\"hostname\":\"%s\",\"rssi\":%d,\"studio\":%s,\"studioPeer\":\"%s\",\"live\":\"%s\","
+           "{\"version\":\"" KLDONGLE_VERSION "\",\"ip\":\"%s\",\"hostname\":\"%s\",\"rssi\":%d,\"studio\":%s,\"studioPeer\":\"%s\",\"live\":\"%s\","
            "\"roasterActive\":%s,\"roasterBusy\":%s,\"lastHostWriteAgo\":%ld,\"usbAttached\":%s,\"writeWindow\":%s,"
            "\"allowWrite\":%s,\"hostReads\":%lu,\"hostWrites\":%lu,\"usbErrors\":%lu,\"used\":%llu,\"size\":%llu,"
            "\"uptime\":%lu,\"heap\":%lu,\"time\":%ld}",
@@ -1725,7 +1727,7 @@ void setup() {
   gFsLock = xSemaphoreCreateRecursiveMutex();
   initLED();
   setLED(128, 64, 0, 8);                                      // orange: starting
-  klog("KLDongle starting");
+  klog("KLDongle %s starting", KLDONGLE_VERSION);
 
   gSdOk = sdInit();
   if (!gSdOk) {

@@ -38,7 +38,7 @@ dongle and plug it in again *without* the button.
 [`docs/flash/`](../docs/flash/):
 
 ```
-esptool --chip esp32s3 write-flash 0x0 kldongle-1.0.0.bin
+esptool --chip esp32s3 write-flash 0x0 kldongle-1.1.0.bin
 ```
 
 Espressif's browser tool [esptool-js](https://espressif.github.io/esptool-js/) does the same: flash address `0x0`.
@@ -80,6 +80,9 @@ IP_PROFILE=1
 
 # Keep-alive to Studio: bridge (default) or cr
 KEEPALIVE=bridge
+
+# 1 = add the roast date to each new log, like roasters with a clock do
+ROAST_DATE=1
 ```
 
 If the file is missing, the dongle creates a template on its first start. The file is read at power-up, so after
@@ -122,8 +125,13 @@ middle of a roast, the live view starts from the beginning of that roast.
   the roaster.
 - **Deleted files** go to `/kl-trash/` on the card. Deleting inside `/kl-trash/` is final.
 - **Studio's *Wifi Module* tab** shows firmware `9.9.9` (so Studio considers it up to date). Do **not** use the
-  *Install* links there: they are for the official module. Studio's *Roast date* column stays empty: the roaster has
-  no clock. The dongle records real start times itself and shows them on the web page.
+  *Install* links there: they are for the official module.
+- **Roast dates**: the roaster has no clock, so the dongle works out when each roast started and, when the roast
+  is over, adds `roast_date:DD/MM/YYYY HH:MM:SS UTC` to the log's header, the same line roasters with a clock write.
+  Studio's *Roast date* column then shows it. The time comes from the internet (NTP) or, without internet, from
+  Studio when it connects; a roast started without either is dated once a clock arrives, as long as the roaster
+  stays on. The line is added before Studio is told the roast has ended, so Studio's copy includes it; the stick is
+  away for about a second. Logs from before the dongle stay undated. `ROAST_DATE=0` turns this off.
 - **Adding profiles**: use Studio or the web page. Copying with the Mac's Finder leaves hidden `._name.kpro` files
   that the roaster may list as broken profiles (`dot_clean -m /Volumes/<card>` removes them).
 - **A `kaffelogic/firmware` folder** for the roaster's update mode is never touched by the dongle, and Studio cannot
@@ -166,6 +174,10 @@ and are not affected. The firmware version is shown at the bottom of the web pag
   registers that name as its DHCP host name. Files Studio pushes outside the profile folder (such as
   `last_connection_uuid`) are kept in the dongle's flash, never on the card. Firmware files are refused.
 - **`!ip` profile**: written once WiFi is up, only when the address changed, and hidden from Studio.
+- **`roast_date`**: once the newest log has not grown for 5 s *and* the roaster has made no USB write for 5 s, the
+  log is copied with the line inserted before `time_jump:` and swapped in by renames (the roaster's file date is
+  kept); only then does Studio get "roast finished". A power cut during the swap leaves `logNNNN.klog.old~` on the
+  card with the original.
 
 | | Pi Zero version | T-Dongle-S3 version |
 |---|---|---|
@@ -182,7 +194,7 @@ and are not affected. The firmware version is shown at the bottom of the web pag
 1. Arduino IDE with the **esp32** boards package by Espressif, version 3.x (built and tested with 3.3.13).
 2. Open `KLDongle/KLDongle.ino`. No extra libraries are needed.
 3. Tools menu: Board **ESP32S3 Dev Module**, USB Mode **USB-OTG (TinyUSB)**, USB CDC On Boot **Disabled**,
-   Flash Size **16MB**, PSRAM **Disabled**.
+   Flash Size **16MB**, Partition Scheme **16M Flash (3MB APP/9.9MB FATFS)**, PSRAM **Disabled**.
 4. Put the dongle in download mode (button), upload, then replug it without the button.
 
 To refresh the browser flasher after a change, merge the build into one image, put it in `docs/flash/` and update

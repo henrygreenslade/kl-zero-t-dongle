@@ -14,6 +14,7 @@
  *
  * Arduino IDE settings (Tools menu), board "ESP32S3 Dev Module", esp32 core 3.x:
  *   USB Mode: "USB-OTG (TinyUSB)"     USB CDC On Boot: "Disabled"     Flash Size: 16MB     PSRAM: Disabled
+ *   Partition Scheme: "16M Flash (3MB APP/9.9MB FATFS)"
  *   No extra libraries are needed.
  *
  * Configuration: wifi_config.txt in the root of the SD card (created with defaults if missing):
@@ -39,6 +40,7 @@
 #include <functional>
 #include <vector>
 #include <time.h>
+#include <sys/time.h>
 #include <stdarg.h>
 #include "USB.h"
 #include "USBMSC.h"
@@ -54,7 +56,7 @@ extern "C" {          // same include order as the core's SD library (sd_diskio.
 #include "mbedtls/base64.h"
 #include "webui.h"
 
-#define KLDONGLE_VERSION "1.0.0"
+#define KLDONGLE_VERSION "1.1.0"
 
 // ------------------------------------------------------------------ T-Dongle-S3 pins
 #define PIN_SD_CLK 12
@@ -78,6 +80,7 @@ static const int      MAX_PACKET     = 8192;
 // the last 20 s means a roast is in progress and the stick must stay with the roaster.
 static const uint32_t BUSY_WINDOW_MS = 20000;   // roaster wrote within this time = roasting -> no writes, sassi_file_lock
 static const uint32_t LIVE_WINDOW_MS = 20000;   // USB host wrote within this time = check whether a roast is running
+static const uint32_t ROAST_DATE_GIVEUP_MS = 60000;   // stop trying to add roast_date this long after the last line
 static const uint32_t ROAST_IDLE_MS  = 5000;    // newest log did not grow for this long = roast finished (it grows every second)
 static const uint32_t WRITE_IDLE_MS  = 1000;    // write window closes after this much idle time (batches Studio pushes)
 static const size_t   UPLOAD_RAM_MAX = 64 * 1024; // web uploads up to this size are buffered first -> shortest window
@@ -110,6 +113,7 @@ struct Config {
   bool allowWrite = true;
   bool ipProfile = true;
   bool keepaliveCr = false;
+  bool roastDate = true;
 };
 
 struct Entry {
@@ -145,7 +149,7 @@ static int gFsDepth = 0;
 static bool gFsOk = false;
 static bool gWriteWin = false;        // stick detached from the roaster, FatFs mounted for writing
 static uint32_t gLastFsWrite = 0;
-static FIL gSassiFil, gWebFil, gWrFil, gUpFil;
+static FIL gSassiFil, gWebFil, gWrFil, gUpFil, gTmpFil;
 static bool gUploadOpen = false;          // upload streaming into a tmp file (large uploads only)
 static bool gUpBuffering = false;         // upload still collecting in RAM
 static std::vector<uint8_t> gUpBuf;
@@ -178,6 +182,8 @@ static char gLiveName[32] = "";
 static volatile bool gRoasting = false;
 static char gRoastName[32] = "";
 static volatile uint32_t gRoastLastGrow = 0;
+static String gPendName;                     // roast whose start is known only against uptime (no clock yet)
+static uint32_t gPendStartMs = 0;
 
 static char gLog[8192];
 static size_t gLogHead = 0;
@@ -607,9 +613,9 @@ bool newestLog(String& name, uint32_t& size) {
 
 // ------------------------------------------------------------------ write window
 // Begin: unplug the stick from the roaster and mount for writing. Must be called with FsUse held.
-int beginWriteInternal() {
+int beginWriteQuiet(uint32_t quietMs) {
   if (gWriteWin) return OC_OK;
-  if (hostBusy(BUSY_WINDOW_MS)) return OC_BUSY;
+  if (hostBusy(quietMs)) return OC_BUSY;
   uint32_t attempts = gHostWriteAttempts;
   usbDetach();
   delay(100);                                   // let an in-flight USB transfer finish
@@ -631,6 +637,8 @@ int beginWriteInternal() {
   klog("stick detached from the roaster for writing");
   return OC_OK;
 }
+
+int beginWriteInternal() { return beginWriteQuiet(BUSY_WINDOW_MS); }
 
 int beginWrite() {
   if (!cfg.allowWrite && !gWriteWin) {
@@ -732,6 +740,10 @@ int fatDelete(const String& rel) {
     fr = f_rename(fp(rel).c_str(), fp(String(TRASH_DIR) + "/" + stamp() + "-" + baseOf(rel)).c_str());
   }
   gLastFsWrite = millis();
+  if (fr == FR_OK && lower(rel).endsWith(".klog")) {
+    String n = baseOf(rel);
+    if (n.length() <= 15 && gDates.isKey(n.c_str())) gDates.remove(n.c_str());   // its start-time note goes too
+  }
   return fr == FR_OK ? OC_OK : OC_CANNOT_DELETE;
 }
 
@@ -1038,6 +1050,12 @@ class Session {
     if (typ == T_TIME_SYNC) {
       synced = true;
       tsBase = strtoull(p[1].c_str(), nullptr, 16) - (uint64_t)(millis() - t0);
+      uint32_t studioNow;
+      if (!timeValid() && parseDt(g(4), studioNow)) {          // no NTP (e.g. no internet): use Studio's clock (UTC)
+        struct timeval tv = { (time_t)studioNow, 0 };
+        settimeofday(&tv, nullptr);
+        klog("clock set from Studio: %s UTC", g(4).c_str());
+      }
       send(T_TIME_SYNC_ACK, {});
       klog("Studio connected from %s (Studio time %s)", peer.c_str(), g(4).c_str());
     } else if (typ == T_DIR_REQ) {
@@ -1312,6 +1330,35 @@ void llmnrPoll() {
 }
 
 // ------------------------------------------------------------------ roast detection + start times
+// "roast_date:DD/MM/YYYY HH:MM:SS UTC" from the first 1 KB of a log (where roasters with a clock, Studio and the
+// dongle put it). 0 if there is none. Caller holds FsUse.
+uint32_t logRoastDate(const String& rel) {
+  if (f_open(&gWebFil, fp(rel).c_str(), FA_READ) != FR_OK) return 0;
+  char head[1025];
+  UINT br = 0;
+  f_read(&gWebFil, head, 1024, &br);
+  f_close(&gWebFil);
+  head[br] = 0;
+  const char* p = strstr(head, "\nroast_date:");
+  unsigned d, mo, y, h, mi, se;
+  if (!p || sscanf(p + 12, "%u/%u/%u %u:%u:%u", &d, &mo, &y, &h, &mi, &se) != 6) return 0;
+  if (y < 2000 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || se > 59) return 0;
+  return mkEpoch(y, mo, d, h, mi, se);
+}
+
+long logNumber(const String& name);
+
+// The dongle's own note of a roast's start, until it is in the log. Keeps at most ~100 (NVS is small).
+void storeRoastStart(const String& name, uint32_t start) {
+  gDates.putUInt(name.c_str(), start);
+  long n = logNumber(name);
+  if (n > 100) {
+    char old[24];
+    snprintf(old, sizeof old, "log%04ld.klog", n - 100);
+    if (gDates.isKey(old)) gDates.remove(old);
+  }
+}
+
 long logNumber(const String& name) {
   String n = lower(name);
   if (!n.startsWith("log") || !n.endsWith(".klog") || n.length() <= 8) return -1;
@@ -1321,12 +1368,16 @@ long logNumber(const String& name) {
 }
 
 void recordRoastDate(const String& name);
+int insertRoastDate(const String& name, uint32_t& newSize);
 
 // About once a second. The roaster appends a line per second to the newest log while roasting and cooling, so
 // "the newest log grew, or a newer log appeared" = roasting. Only scans while the USB host is writing (or a roast
 // is running), so an idle card is left alone. Plain write activity alone is not a roast (a computer as host
 // writes all the time).
+void resolvePendingRoastDate();
+
 void roastTick() {
+  resolvePendingRoastDate();
   static String seenName;
   static uint32_t seenSize = 0;
   static long seenNum = -1;
@@ -1346,6 +1397,9 @@ void roastTick() {
           strncpy(gRoastName, name.c_str(), sizeof gRoastName - 1);
           gRoasting = true;
           klog("roast detected: %s is growing", name.c_str());
+          // A new roast: any note under this name belongs to an older, deleted log (the roaster reuses numbers).
+          if (gDates.isKey(name.c_str())) gDates.remove(name.c_str());
+          if (gPendName == name) gPendName = "";
         }
         recordRoastDate(name);
       }
@@ -1354,15 +1408,115 @@ void roastTick() {
     }
   }
   if (gRoasting && millis() - gRoastLastGrow >= ROAST_IDLE_MS) {
+    // Before reporting the end (Studio then downloads the final log), add roast_date to the log - once the roaster
+    // has also stopped writing. Give up after a while rather than keep the roast "running".
+    static String datedName;
+    if (datedName != gRoastName && millis() - gRoastLastGrow < ROAST_DATE_GIVEUP_MS) {
+      if (hostBusy(ROAST_IDLE_MS)) return;                    // roaster still writing (closing the file): wait
+      resolvePendingRoastDate();
+      uint32_t newSize = 0;
+      int r = insertRoastDate(gRoastName, newSize);
+      if (r == OC_BUSY) return;                               // try again next tick
+      datedName = gRoastName;
+      if (r == OC_OK && newSize && seenName == gRoastName) seenSize = newSize;   // our own change is not "growth"
+    }
     gRoasting = false;
     klog("roast finished: %s", gRoastName);
   }
 }
 
+// Add "roast_date:DD/MM/YYYY HH:MM:SS UTC" to the header of a finished log, before "time_jump:" - where roasters
+// with a clock write it - so Studio shows the roast date. The file is rewritten to a tmp file and swapped in by
+// renames; the roaster's own file date is kept. OC_OK = added, OC_BUSY = try later, anything else = skipped.
+int insertRoastDate(const String& name, uint32_t& newSize) {
+  if (!cfg.roastDate || !cfg.allowWrite || name.length() > 15) return OC_DENIED;
+  uint32_t start = gDates.getUInt(name.c_str(), 0);
+  if (!start) return OC_NOT_FOUND;                            // start time unknown (no clock during the roast)
+  String rel = String(LOG_DIR) + "/" + name, tmp = rel + ".tmp~", old = rel + ".old~";
+  FsUse u;
+  if (!u.ok) return OC_SYS_ERR;
+  // Look at the header first (read-only): already dated? where to insert?
+  if (f_open(&gWrFil, fp(rel).c_str(), FA_READ) != FR_OK) return OC_NOT_FOUND;
+  UINT br = 0;
+  f_read(&gWrFil, gWebBuf, sizeof gWebBuf - 1, &br);
+  f_close(&gWrFil);
+  gWebBuf[br] = 0;
+  const char* head = (const char*)gWebBuf;
+  if (strncmp(head, "log_file_name:", 14) != 0 || strstr(head, "\nroast_date:")) return OC_DENIED;
+  const char* at = strstr(head, "\ntime_jump:");
+  if (!at) at = strstr(head, "\noffsets");
+  if (!at) return OC_DENIED;
+  uint32_t insertAt = (uint32_t)(at - head) + 1;              // start of that line
+
+  int r = beginWriteQuiet(ROAST_IDLE_MS);                     // the roaster has been quiet for 5 s
+  if (r != OC_OK) return r;
+  gLastFsWrite = millis();
+  FILINFO orig;
+  if (f_stat(fp(rel).c_str(), &orig) != FR_OK) return OC_NOT_FOUND;
+  int64_t days = start / 86400;
+  int y; unsigned mo, d;
+  civilFromDays(days, y, mo, d);
+  uint32_t sec = start % 86400;
+  char line[48];
+  int ll = snprintf(line, sizeof line, "roast_date:%02u/%02u/%04d %02lu:%02lu:%02lu UTC\n", d, mo, y,
+                    (unsigned long)(sec / 3600), (unsigned long)((sec / 60) % 60), (unsigned long)(sec % 60));
+  bool ok = f_open(&gWrFil, fp(rel).c_str(), FA_READ) == FR_OK;
+  if (ok && f_open(&gTmpFil, fp(tmp).c_str(), FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) { f_close(&gWrFil); ok = false; }
+  if (ok) {
+    UINT bw;
+    uint32_t pos = 0;
+    bool inserted = false;
+    while (ok) {
+      UINT want = sizeof gWebBuf;
+      if (!inserted && insertAt - pos < want) want = insertAt - pos;
+      if (want == 0 && !inserted) {
+        ok = f_write(&gTmpFil, line, ll, &bw) == FR_OK && bw == (UINT)ll;
+        inserted = true;
+        continue;
+      }
+      if (f_read(&gWrFil, gWebBuf, want, &br) != FR_OK) { ok = false; break; }
+      if (br == 0) break;
+      ok = f_write(&gTmpFil, gWebBuf, br, &bw) == FR_OK && bw == br;
+      pos += br;
+    }
+    ok = ok && inserted;
+    f_close(&gWrFil);
+    newSize = f_size(&gTmpFil);
+    if (f_close(&gTmpFil) != FR_OK) ok = false;
+  }
+  // swap: log -> .old~, tmp -> log, drop .old~ (a power cut in between leaves both copies on the card)
+  if (ok) ok = f_rename(fp(rel).c_str(), fp(old).c_str()) == FR_OK;
+  if (ok) {
+    if (f_rename(fp(tmp).c_str(), fp(rel).c_str()) == FR_OK) {
+      f_utime(fp(rel).c_str(), &orig);                         // keep the roaster's file date
+      f_unlink(fp(old).c_str());
+    } else {
+      f_rename(fp(old).c_str(), fp(rel).c_str());              // put the original back
+      ok = false;
+    }
+  }
+  if (!ok) f_unlink(fp(tmp).c_str());
+  gLastFsWrite = millis();
+  klog("roast_date %.*s -> %s %s", ll - 12, line + 11, name.c_str(), ok ? "added" : "FAILED (log unchanged)");
+  if (ok) gDates.remove(name.c_str());                         // the date now lives in the log
+  return ok ? OC_OK : OC_CANNOT_SAVE;
+}
+
 // The roaster has no clock (every klog is dated 2001-01-01): remember when this roast started =
-// now - seconds in its last line. Once per log, only with NTP time.
+// now - seconds in its last line. Clock: NTP, or Studio's TIME_SYNC. Without either yet, the start is kept against
+// the dongle's uptime and converted once a clock arrives (same power session).
+
+void resolvePendingRoastDate() {
+  if (!gPendName.length() || !timeValid()) return;
+  uint32_t start = (uint32_t)time(nullptr) - (millis() - gPendStartMs) / 1000;
+  storeRoastStart(gPendName, start);
+  klog("roast %s: started %s UTC (clock arrived later)", gPendName.c_str(), sassiDt(start).c_str());
+  gPendName = "";
+}
+
 void recordRoastDate(const String& name) {
-  if (!timeValid() || name.length() > 15 || gDates.isKey(name.c_str())) return;
+  resolvePendingRoastDate();
+  if (name.length() > 15 || gDates.isKey(name.c_str()) || gPendName == name) return;
   FsUse u;
   if (!u.ok) return;
   String rel = String(LOG_DIR) + "/" + name;
@@ -1390,8 +1544,15 @@ void recordRoastDate(const String& name) {
     bool num = true;
     for (int i = 0; i < tab; i++) if (!isdigit((unsigned char)line[i]) && i != dot) num = false;
     if (!num) continue;
-    uint32_t start = (uint32_t)(time(nullptr) - (time_t)line.substring(0, tab).toFloat());
-    gDates.putUInt(name.c_str(), start);
+    float secs = line.substring(0, tab).toFloat();
+    if (!timeValid()) {
+      gPendName = name;
+      gPendStartMs = millis() - (uint32_t)(secs * 1000);
+      klog("roast %s: no clock yet - start time kept until NTP or Studio provides one", name.c_str());
+      return;
+    }
+    uint32_t start = (uint32_t)(time(nullptr) - (time_t)secs);
+    storeRoastStart(name, start);
     klog("roast %s: started %s UTC", name.c_str(), sassiDt(start).c_str());
     return;
   }
@@ -1412,7 +1573,8 @@ void loadConfig() {
       "# SERIAL=KLDONGLE01       (serial number shown in Studio)\r\n"
       "# ALLOW_WRITE=1           (0 = Studio and the web page cannot change the card)\r\n"
       "# IP_PROFILE=1            (1 = show the IP address as a profile named !ip on the roaster)\r\n"
-      "# KEEPALIVE=bridge        (cr = send a bare CR as keep-alive)\r\n";
+      "# KEEPALIVE=bridge        (cr = send a bare CR as keep-alive)\r\n"
+      "# ROAST_DATE=1            (1 = add roast_date to each new log, as roasters with a clock do)\r\n";
     fatWriteFile(CONFIG_FILE, (const uint8_t*)def, strlen(def), 0, true);
     return;
   }
@@ -1436,6 +1598,7 @@ void loadConfig() {
     else if (k == "ALLOW_WRITE") cfg.allowWrite = v != "0";
     else if (k == "IP_PROFILE") cfg.ipProfile = v != "0";
     else if (k == "KEEPALIVE") cfg.keepaliveCr = lower(v) == "cr";
+    else if (k == "ROAST_DATE") cfg.roastDate = v != "0";
   }
   if (cfg.ssid == "YourNetworkName") cfg.ssid = "";
   klog("config: SSID '%s', hostname %s, writes %s", cfg.ssid.c_str(), cfg.hostname.c_str(), cfg.allowWrite ? "allowed" : "off");
@@ -1512,7 +1675,11 @@ void handleList() {
     if (n.startsWith(".") || n == "System Volume Information" || n == "$RECYCLE.BIN" || n.endsWith(".tmp~")) return;
     if (!first) out += ",";
     first = false;
-    uint32_t roasted = (isLogs && n.length() <= 15) ? gDates.getUInt(n.c_str(), 0) : 0;
+    uint32_t roasted = 0;
+    if (isLogs && lower(n).endsWith(".klog") && !(f.fattrib & AM_DIR)) {
+      roasted = logRoastDate(String(LOG_DIR) + "/" + n);       // roast_date in the log itself
+      if (!roasted && n.length() <= 15) roasted = gDates.getUInt(n.c_str(), 0);   // not yet written into the log
+    }
     String child = n;
     if (rel.length()) child = rel + "/" + n;
     out += "{\"name\":\"" + jsonEsc(n) + "\",\"path\":\"/" + jsonEsc(child) +
@@ -1749,7 +1916,7 @@ void setup() {
   if (gNoFs) klog("no FAT file system on the card - format it FAT32 (the dongle still shows up as a USB disk, so a computer can format it)");
   else loadConfig();
   ovLoad();
-  gDates.begin("kl-roasts", false);
+  gDates.begin("kl-roast-start", false);                       // new name in 1.1.0: drops 1.0.0's notes (some stale)
 
   if (cfg.ssid.length()) {
     WiFi.persistent(false);

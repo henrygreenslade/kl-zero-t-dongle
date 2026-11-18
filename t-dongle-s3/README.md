@@ -47,9 +47,18 @@ Espressif's browser tool [esptool-js](https://espressif.github.io/esptool-js/) d
 
 ## 2. Prepare the card
 
-1. Format the microSD card **FAT32** (on a Mac: Disk Utility, *MS-DOS (FAT)*) and copy your stick's files onto it.
-   You can do this with the card in the dongle: plugged into a computer, the dongle is just a USB disk.
-2. Create `wifi_config.txt` in the root of the card. Only `SSID` and `PSK` are needed; the rest shows the defaults:
+1. Insert the microSD card. The slot is **inside the USB-A plug**: slide the card in label up, contacts first,
+   until it sits flush with the end of the plug.
+
+   <p align="center">
+     <img src="img/sd-insert-1.jpg" width="30%" alt="microSD card half inserted into the slot in the dongle's USB-A plug, label up">
+     <img src="img/sd-insert-2.jpg" width="30%" alt="The card almost fully inserted">
+     <img src="img/sd-insert-3.jpg" width="30%" alt="The card fully inserted, flush with the end of the plug">
+   </p>
+
+2. Format the card **FAT32** (on a Mac: Disk Utility, *MS-DOS (FAT)*) and copy your stick's files onto it. You can
+   do this with the card in the dongle: plugged into a computer, the dongle is just a USB disk.
+3. Create `wifi_config.txt` in the root of the card. Only `SSID` and `PSK` are needed; the rest shows the defaults:
 
 ```
 # WiFi Configuration

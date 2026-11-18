@@ -44,6 +44,10 @@ with `kl-sassi`.
 
 ![Studio: Wifi Module tab](docs/img/studio-wifi-module.png)
 
+> **ESP32 alternative:** [`t-dongle-s3/`](t-dongle-s3/) is an Arduino port for the LILYGO T-Dongle-S3. It plugs
+> straight into the roaster, uses its own microSD card as the stick and adds a web file manager. New; Studio sync and
+> live logging have been tried on a roaster.
+
 ## Why this exists
 
 Newer Nano 7 boards have USB-C and can talk to Studio directly (and people tunnel that over WiFi with USB/IP).

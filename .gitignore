@@ -4,3 +4,5 @@ __pycache__/
 *.klog
 *.kpro
 *.bin
+USBESPKL*
+.DS_Store

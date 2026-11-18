@@ -132,6 +132,7 @@ typedef std::function<void(const FILINFO&)> DirCb;
 static Config cfg;
 static sdmmc_card_t gCard;
 static bool gSdOk = false;
+static bool gNoFs = false;            // card present but no FAT file system (unformatted)
 static SemaphoreHandle_t gSdLock;     // one SD transaction at a time (USB host vs. our FatFs)
 static SemaphoreHandle_t gFsLock;     // recursive: FatFs mount/use
 static SemaphoreHandle_t gLogLock;
@@ -1688,7 +1689,7 @@ void ledTick() {
   static uint32_t last = 0;
   static int lastState = -1;
   int st;
-  if (!gSdOk) st = 0;
+  if (!gSdOk || gNoFs) st = 0;
   else if (gWriteWin) st = 1;
   else if (gRoasting) st = 2;
   else if (gStudioConnected) st = 3;
@@ -1701,7 +1702,7 @@ void ledTick() {
   lastState = st;
   bool on = !animated || ((millis() / 500) & 1);
   switch (st) {
-    case 0: setLED(on ? 128 : 0, 0, 0, 20); break;            // red blink: SD card problem
+    case 0: setLED(on ? 128 : 0, 0, 0, 20); break;            // red blink: no SD card, or card not formatted
     case 1: setLED(128, 128, 0, 8); break;                    // yellow: writing (stick away from the roaster)
     case 2: {                                                 // roasting: breathe orange <-> red (4 s cycle)
       float ph = (millis() % 4000) / 4000.0f;
@@ -1742,7 +1743,8 @@ void setup() {
   gFsOk = f_mount(&gFs, gDrv, 1) == FR_OK;
   gLastFsWrite = millis();
   xSemaphoreGiveRecursive(gFsLock);
-  if (!gFsOk) klog("no FAT file system on the card - format it FAT32 (or copy your stick onto it)");
+  gNoFs = !gFsOk;
+  if (gNoFs) klog("no FAT file system on the card - format it FAT32 (the dongle still shows up as a USB disk, so a computer can format it)");
   else loadConfig();
   ovLoad();
   gDates.begin("kl-roasts", false);

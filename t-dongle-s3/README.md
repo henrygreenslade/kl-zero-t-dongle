@@ -57,6 +57,10 @@ so no case or cable is needed, and it is ready a few seconds after the roaster i
 
 - FAT32. Either copy the contents of your Kaffelogic stick onto a freshly formatted card, or clone the stick
   image onto it.
+- The dongle never formats the card itself (a card that fails to mount once must not be wiped). With an
+  unformatted card the LED blinks red and no `wifi_config.txt` can be created, but the dongle still appears as a USB
+  disk: plug it into a computer, format the disk as FAT32 (MS-DOS FAT on a Mac), copy your stick's files onto it
+  and replug. A formatted card without `wifi_config.txt` gets a template on the next start.
 - Put `wifi_config.txt` in the root (it is created with defaults on first start if missing):
 
 ```
@@ -89,7 +93,7 @@ LED:
 | cyan | Studio connected |
 | breathing orange ↔ red | roasting (the newest log is growing) |
 | yellow | writing to the card; the stick is briefly away from the roaster |
-| blinking red | no SD card |
+| blinking red | no SD card, or the card is not formatted (FAT32) |
 
 ## Limitations
 

@@ -14,7 +14,7 @@
  *
  * Arduino IDE settings (Tools menu), board "ESP32S3 Dev Module", esp32 core 3.x:
  *   USB Mode: "USB-OTG (TinyUSB)"     USB CDC On Boot: "Disabled"     Flash Size: 16MB     PSRAM: Disabled
- *   Partition Scheme: "16M Flash (3MB APP/9.9MB FATFS)"
+ *   Partition Scheme: "16M Flash (3MB APP/9.9MB FATFS)" (size limit only; the table comes from partitions.csv)
  *   No extra libraries are needed.
  *
  * Configuration: wifi_config.txt in the root of the SD card (created with defaults if missing):
@@ -39,6 +39,7 @@
 #include <Preferences.h>
 #include <functional>
 #include <vector>
+#include <algorithm>
 #include <time.h>
 #include <sys/time.h>
 #include <stdarg.h>
@@ -53,10 +54,12 @@ extern "C" {          // same include order as the core's SD library (sd_diskio.
 #include "diskio_impl.h"
 }
 #include "esp_heap_caps.h"
+#include "esp_partition.h"
+#include "wear_levelling.h"
 #include "mbedtls/base64.h"
 #include "webui.h"
 
-#define KLDONGLE_VERSION "1.1.0"
+#define KLDONGLE_VERSION "1.2.0"
 
 // ------------------------------------------------------------------ T-Dongle-S3 pins
 #define PIN_SD_CLK 12
@@ -109,11 +112,13 @@ enum { ACT_CONN_CONTROL = 4, ACT_FS_CLEANUP = 110 };
 struct Config {
   String ssid, psk;
   String hostname = "KaffelogicWM";
-  String serial = "KLDONGLE01";
+  String serial;                        // empty = the roaster's serial from its logs
+  String firmware = "9.9.9";             // reported to Studio; "log" = the roaster's real version from its logs
   bool allowWrite = true;
   bool ipProfile = true;
   bool keepaliveCr = false;
   bool roastDate = true;
+  int keepLogs = -1;                     // -1 = auto: 100 on internal flash, off on an SD card; 0 = off
 };
 
 struct Entry {
@@ -137,9 +142,15 @@ typedef std::function<void(const FILINFO&)> DirCb;
 // ------------------------------------------------------------------ globals
 static Config cfg;
 static sdmmc_card_t gCard;
-static bool gSdOk = false;
-static bool gNoFs = false;            // card present but no FAT file system (unformatted)
-static SemaphoreHandle_t gSdLock;     // one SD transaction at a time (USB host vs. our FatFs)
+static bool gSdOk = false;            // storage available (SD card or internal flash)
+static bool gNoFs = false;            // storage present but no FAT file system (unformatted)
+static SemaphoreHandle_t gSdLock;     // one storage transaction at a time (USB host vs. our FatFs)
+enum { STORE_NONE, STORE_SD, STORE_FLASH };
+static int gStore = STORE_NONE;       // SD card if one is inserted, otherwise the internal flash
+static uint32_t gBlkSectors = 0;      // size in 512-byte sectors
+static wl_handle_t gWl = WL_INVALID_HANDLE;
+static size_t gWlSector = 4096;
+static uint8_t gSecBuf[4096];         // read-modify-write buffer for the internal flash
 static SemaphoreHandle_t gFsLock;     // recursive: FatFs mount/use
 static SemaphoreHandle_t gLogLock;
 static BYTE gPdrv = 0xFF;
@@ -369,34 +380,70 @@ bool sdInit() {
   return false;
 }
 
-esp_err_t sdRead(void* buf, uint32_t lba, uint32_t count) {
+// Internal flash (no card inserted): the "ffat" partition through ESP-IDF wear levelling. Flash is erased in 4 KB
+// sectors but the roaster expects 512-byte sectors, so a write is read-modify-erase-write of each 4 KB sector it
+// touches - skipped when the data is unchanged (the roaster rewrites the same FAT sectors a lot).
+bool flashInit() {
+  const esp_partition_t* p = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, nullptr);
+  if (!p) { klog("no internal storage partition (see partitions.csv)"); return false; }
+  esp_err_t e = wl_mount(p, &gWl);
+  if (e != ESP_OK) { klog("internal storage: wear levelling failed: %s", esp_err_to_name(e)); return false; }
+  gWlSector = wl_sector_size(gWl);
+  if (gWlSector > sizeof gSecBuf || gWlSector % 512) { klog("internal storage: unexpected sector size %u", (unsigned)gWlSector); return false; }
+  gBlkSectors = wl_size(gWl) / 512;
+  klog("no SD card - using internal flash: %lu KB", (unsigned long)(gBlkSectors / 2));
+  return true;
+}
+
+static esp_err_t flashWriteLocked(const uint8_t* src, uint32_t lba, uint32_t count) {
+  size_t off = (size_t)lba * 512, len = (size_t)count * 512;
+  while (len) {
+    size_t sec = off / gWlSector * gWlSector, in = off - sec;
+    size_t n = len < gWlSector - in ? len : gWlSector - in;
+    esp_err_t e = wl_read(gWl, sec, gSecBuf, gWlSector);
+    if (e != ESP_OK) return e;
+    if (memcmp(gSecBuf + in, src, n) != 0) {                  // unchanged data: no erase, no wear
+      memcpy(gSecBuf + in, src, n);
+      if ((e = wl_erase_range(gWl, sec, gWlSector)) != ESP_OK) return e;
+      if ((e = wl_write(gWl, sec, gSecBuf, gWlSector)) != ESP_OK) return e;
+    }
+    off += n; src += n; len -= n;
+  }
+  return ESP_OK;
+}
+
+esp_err_t blkRead(void* buf, uint32_t lba, uint32_t count) {
+  if ((uint64_t)lba + count > gBlkSectors) return ESP_ERR_INVALID_SIZE;
   xSemaphoreTake(gSdLock, portMAX_DELAY);
-  esp_err_t e = sdmmc_read_sectors(&gCard, buf, lba, count);
+  esp_err_t e = gStore == STORE_SD ? sdmmc_read_sectors(&gCard, buf, lba, count)
+                                   : wl_read(gWl, (size_t)lba * 512, buf, (size_t)count * 512);
   xSemaphoreGive(gSdLock);
   return e;
 }
 
-esp_err_t sdWrite(const void* buf, uint32_t lba, uint32_t count) {
+esp_err_t blkWrite(const void* buf, uint32_t lba, uint32_t count) {
+  if ((uint64_t)lba + count > gBlkSectors) return ESP_ERR_INVALID_SIZE;
   xSemaphoreTake(gSdLock, portMAX_DELAY);
-  esp_err_t e = sdmmc_write_sectors(&gCard, buf, lba, count);
+  esp_err_t e = gStore == STORE_SD ? sdmmc_write_sectors(&gCard, buf, lba, count)
+                                   : flashWriteLocked((const uint8_t*)buf, lba, count);
   xSemaphoreGive(gSdLock);
   return e;
 }
 
-// FatFs disk driver on top of sdRead/sdWrite (so FatFs and the USB host never interleave on the card)
+// FatFs disk driver on top of blkRead/blkWrite (so FatFs and the USB host never interleave on the storage)
 static DSTATUS dioInit(unsigned char pdrv) { return 0; }
 static DSTATUS dioStatus(unsigned char pdrv) { return 0; }
 static DRESULT dioRead(unsigned char pdrv, unsigned char* buff, uint32_t sector, unsigned count) {
-  return sdRead(buff, sector, count) == ESP_OK ? RES_OK : RES_ERROR;
+  return blkRead(buff, sector, count) == ESP_OK ? RES_OK : RES_ERROR;
 }
 static DRESULT dioWrite(unsigned char pdrv, const unsigned char* buff, uint32_t sector, unsigned count) {
-  return sdWrite(buff, sector, count) == ESP_OK ? RES_OK : RES_ERROR;
+  return blkWrite(buff, sector, count) == ESP_OK ? RES_OK : RES_ERROR;
 }
 static DRESULT dioIoctl(unsigned char pdrv, unsigned char cmd, void* buff) {
   switch (cmd) {
     case CTRL_SYNC: return RES_OK;
-    case GET_SECTOR_COUNT: *(LBA_t*)buff = gCard.csd.capacity; return RES_OK;
-    case GET_SECTOR_SIZE: *(WORD*)buff = gCard.csd.sector_size; return RES_OK;
+    case GET_SECTOR_COUNT: *(LBA_t*)buff = gBlkSectors; return RES_OK;
+    case GET_SECTOR_SIZE: *(WORD*)buff = 512; return RES_OK;
     case GET_BLOCK_SIZE: *(DWORD*)buff = 1; return RES_OK;
     case CTRL_TRIM: return RES_OK;
   }
@@ -416,7 +463,7 @@ void clearDirtyFlag() {
   uint8_t* b = (uint8_t*)heap_caps_malloc(512, MALLOC_CAP_DMA);
   if (!b) return;
   uint32_t lba = 0;
-  if (sdRead(b, 0, 1) == ESP_OK) {
+  if (blkRead(b, 0, 1) == ESP_OK) {
     if (!isVbr(b) && b[510] == 0x55 && b[511] == 0xAA) {            // MBR: first FAT partition
       for (int i = 0; i < 4; i++) {
         uint8_t type = b[0x1BE + 16 * i + 4];
@@ -425,14 +472,14 @@ void clearDirtyFlag() {
           break;
         }
       }
-      if (lba == 0 || sdRead(b, lba, 1) != ESP_OK) { free(b); return; }
+      if (lba == 0 || blkRead(b, lba, 1) != ESP_OK) { free(b); return; }
     }
     if (isVbr(b)) {
       int off = le16(b + 22) == 0 ? 0x41 : 0x25;                     // FAT32 : FAT12/16
       if (b[off]) {
         klog("FAT dirty flag was 0x%02x - cleared", b[off]);
         b[off] = 0;
-        sdWrite(b, lba, 1);
+        blkWrite(b, lba, 1);
       }
     }
   }
@@ -443,7 +490,7 @@ void clearDirtyFlag() {
 static int32_t mscRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
   if (!gUsbAttached) return -1;
   gHostReads++;
-  if (sdRead(buffer, lba, bufsize / 512) == ESP_OK) return bufsize;
+  if (blkRead(buffer, lba, bufsize / 512) == ESP_OK) return bufsize;
   gUsbErrors++;
   return -1;
 }
@@ -454,7 +501,7 @@ static int32_t mscWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t
   gHostWriteAttempts++;
   if (!gUsbAttached) { gUsbErrors++; return -1; }
   gHostWrites++;
-  if (sdWrite(buffer, lba, bufsize / 512) == ESP_OK) return bufsize;
+  if (blkWrite(buffer, lba, bufsize / 512) == ESP_OK) return bufsize;
   gUsbErrors++;
   return -1;
 }
@@ -733,7 +780,7 @@ int fatDelete(const String& rel) {
   if (r != OC_OK) return r;
   gLastFsWrite = millis();
   FRESULT fr;
-  if (e.dir || lower(rel).startsWith(String(TRASH_DIR) + "/")) {
+  if (e.dir || lower(rel).startsWith(String(TRASH_DIR) + "/") || gStore == STORE_FLASH) {
     fr = f_unlink(fp(rel).c_str());
   } else {
     f_mkdir(fp(TRASH_DIR).c_str());
@@ -860,6 +907,8 @@ String firmwareVersion() {
   }
   return "";
 }
+
+long logNumber(const String& name);
 
 // ------------------------------------------------------------------ SASSI session (Studio)
 class Session {
@@ -1024,7 +1073,9 @@ class Session {
   String info(int code) {
     if (code == INFO_OPSTATUS) return String("sassi_file_lock:") + (hostBusy(BUSY_WINDOW_MS) ? "1" : "0");
     if (code == INFO_SYSTEM) {
-      String fw = firmwareVersion();                          // from the newest klog; no key if not found
+      // Default 9.9.9: newer than any release, so Studio stops offering roaster firmware updates (which cannot
+      // be installed through the stick). FIRMWARE=log reports the version from the newest klog.
+      String fw = cfg.firmware == "log" ? firmwareVersion() : cfg.firmware;
       String r = "model:Nano 7;serial:" + cfg.serial;
       if (fw.length()) r += ";firmware:" + fw;
       return r;
@@ -1089,8 +1140,10 @@ class Session {
         FsUse u;
         if (!fatStat(path, e) || e.dir) { send(T_FILE_RESP, { path, String(OC_NOT_FOUND), "", "0", "" }); return; }
         String dt = sassiDt(e.mtime);
-        sendFile(T_FILE_RESP, path, 0, e.size,
+        bool sent = sendFile(T_FILE_RESP, path, 0, e.size,
                  [&](int oc, int seq, const String& b) -> Fields { return { path, String(oc), dt, String(seq), b }; });
+        long n = lower(parentOf(path)) == LOG_DIR ? logNumber(baseOf(path)) : -1;
+        if (sent && n > gDates.getInt("studio_max", -1)) gDates.putInt("studio_max", n);   // for the log clean-up
       } else {
         OvFile* f = ovFind(path);
         if (!f) { send(T_FILE_RESP, { path, String(OC_NOT_FOUND), "", "0", "" }); return; }
@@ -1368,6 +1421,7 @@ long logNumber(const String& name) {
 }
 
 void recordRoastDate(const String& name);
+void collectLogs();
 int insertRoastDate(const String& name, uint32_t& newSize);
 
 // About once a second. The roaster appends a line per second to the newest log while roasting and cooling, so
@@ -1419,6 +1473,7 @@ void roastTick() {
       if (r == OC_BUSY) return;                               // try again next tick
       datedName = gRoastName;
       if (r == OC_OK && newSize && seenName == gRoastName) seenSize = newSize;   // our own change is not "growth"
+      collectLogs();
     }
     gRoasting = false;
     klog("roast finished: %s", gRoastName);
@@ -1558,7 +1613,53 @@ void recordRoastDate(const String& name) {
   }
 }
 
+// ------------------------------------------------------------------ log clean-up (KEEP_LOGS)
+// Keeps the newest N logs: older ones are removed, oldest first - but only logs Studio has already downloaded
+// (up to the newest log it fetched), so nothing is lost that was never copied. On an SD card removed logs go to
+// kl-trash; on internal flash they are deleted (a trash would use the space). Runs at power-up and after a roast.
+void collectLogs() {
+  int keep = cfg.keepLogs >= 0 ? cfg.keepLogs : (gStore == STORE_FLASH ? 100 : 0);
+  if (keep <= 0 || !cfg.allowWrite) return;
+  long studioMax = gDates.getInt("studio_max", -1);
+  FsUse u;
+  if (!u.ok) return;
+  std::vector<std::pair<long, String>> logs;
+  fatForEach(LOG_DIR, [&](const FILINFO& f) {
+    long n = (f.fattrib & AM_DIR) ? -1 : logNumber(String(f.fname));
+    if (n >= 0) logs.push_back({ n, String(f.fname) });
+  });
+  if ((int)logs.size() <= keep) return;
+  std::sort(logs.begin(), logs.end(), [](const std::pair<long, String>& a, const std::pair<long, String>& b) { return a.first < b.first; });
+  size_t excess = logs.size() - keep;
+  int removed = 0, kept = 0;
+  for (size_t i = 0; i < excess; i++) {
+    if (logs[i].first > studioMax) { kept++; continue; }      // Studio has not copied it yet
+    if (beginWriteQuiet(ROAST_IDLE_MS) != OC_OK) break;        // the roaster is busy: next time
+    if (fatDelete(String(LOG_DIR) + "/" + logs[i].second) == OC_OK) removed++;
+  }
+  if (removed || kept)
+    klog("log clean-up: %d logs, keeping %d - removed %d oldest%s", (int)logs.size(), keep, removed,
+         kept ? ", kept some Studio has not copied yet" : "");
+}
+
 // ------------------------------------------------------------------ config + IP profile
+// The roaster's serial number: last part of "model:KN1007B/E/B33072" in the newest log.
+String serialFromLogs() {
+  String name, head;
+  uint32_t size;
+  FsUse u;
+  if (!u.ok || !newestLog(name, size) || !fatReadHead(String(LOG_DIR) + "/" + name, head, 4000)) return "";
+  int i = head.indexOf("\nmodel:");
+  if (i < 0) return "";
+  int j = head.indexOf('\n', i + 1);
+  String m = head.substring(i + 7, j < 0 ? head.length() : j);
+  m.trim();
+  String sn = m.substring(m.lastIndexOf('/') + 1);
+  if (sn.length() < 4 || sn.length() > 20) return "";
+  for (size_t k = 0; k < sn.length(); k++) if (!isalnum((unsigned char)sn[k])) return "";
+  return sn;
+}
+
 void loadConfig() {
   String text;
   if (!fatReadHead(CONFIG_FILE, text, 4096)) {
@@ -1570,11 +1671,13 @@ void loadConfig() {
       "\r\n"
       "# Optional\r\n"
       "# HOSTNAME=KaffelogicWM   (the name Kaffelogic Studio looks for)\r\n"
-      "# SERIAL=KLDONGLE01       (serial number shown in Studio)\r\n"
+      "# SERIAL=                 (serial shown in Studio; default: the roaster's, from its logs)\r\n"
+      "# FIRMWARE=9.9.9          (firmware reported to Studio; log = the roaster's real version)\r\n"
       "# ALLOW_WRITE=1           (0 = Studio and the web page cannot change the card)\r\n"
       "# IP_PROFILE=1            (1 = show the IP address as a profile named !ip on the roaster)\r\n"
       "# KEEPALIVE=bridge        (cr = send a bare CR as keep-alive)\r\n"
-      "# ROAST_DATE=1            (1 = add roast_date to each new log, as roasters with a clock do)\r\n";
+      "# ROAST_DATE=1            (1 = add roast_date to each new log, as roasters with a clock do)\r\n"
+      "# KEEP_LOGS=auto          (keep the newest N logs; auto = 100 on internal storage, all on an SD card)\r\n";
     fatWriteFile(CONFIG_FILE, (const uint8_t*)def, strlen(def), 0, true);
     return;
   }
@@ -1595,12 +1698,16 @@ void loadConfig() {
     else if (k == "PSK") cfg.psk = v;
     else if (k == "HOSTNAME" && v.length()) cfg.hostname = v;
     else if (k == "SERIAL" && v.length()) cfg.serial = v;
+    else if (k == "FIRMWARE" && v.length()) cfg.firmware = v;
     else if (k == "ALLOW_WRITE") cfg.allowWrite = v != "0";
     else if (k == "IP_PROFILE") cfg.ipProfile = v != "0";
     else if (k == "KEEPALIVE") cfg.keepaliveCr = lower(v) == "cr";
     else if (k == "ROAST_DATE") cfg.roastDate = v != "0";
+    else if (k == "KEEP_LOGS") cfg.keepLogs = lower(v) == "auto" ? -1 : v.toInt();
   }
   if (cfg.ssid == "YourNetworkName") cfg.ssid = "";
+  if (!cfg.serial.length()) cfg.serial = serialFromLogs();
+  if (!cfg.serial.length()) cfg.serial = "KLDONGLE01";
   klog("config: SSID '%s', hostname %s, writes %s", cfg.ssid.c_str(), cfg.hostname.c_str(), cfg.allowWrite ? "allowed" : "off");
 }
 
@@ -1696,10 +1803,11 @@ void handleStatus() {
   if (!gWriteWin) fatUsage(used, size);
   char b[900];
   snprintf(b, sizeof b,
-           "{\"version\":\"" KLDONGLE_VERSION "\",\"ip\":\"%s\",\"hostname\":\"%s\",\"rssi\":%d,\"studio\":%s,\"studioPeer\":\"%s\",\"live\":\"%s\","
+           "{\"version\":\"" KLDONGLE_VERSION "\",\"storage\":\"%s\",\"ip\":\"%s\",\"hostname\":\"%s\",\"rssi\":%d,\"studio\":%s,\"studioPeer\":\"%s\",\"live\":\"%s\","
            "\"roasterActive\":%s,\"roasterBusy\":%s,\"lastHostWriteAgo\":%ld,\"usbAttached\":%s,\"writeWindow\":%s,"
            "\"allowWrite\":%s,\"hostReads\":%lu,\"hostWrites\":%lu,\"usbErrors\":%lu,\"used\":%llu,\"size\":%llu,"
            "\"uptime\":%lu,\"heap\":%lu,\"time\":%ld}",
+           gStore == STORE_SD ? "SD card" : "internal flash",
            WiFi.localIP().toString().c_str(), jsonEsc(cfg.hostname).c_str(), WiFi.RSSI(),
            gStudioConnected ? "true" : "false", gStudioPeer, gRoasting ? gRoastName : "",
            hostBusy(LIVE_WINDOW_MS) ? "true" : "false", hostBusy(BUSY_WINDOW_MS) ? "true" : "false",
@@ -1885,6 +1993,17 @@ void ledTick() {
   }
 }
 
+// Internal flash is formatted only if it has never held a file system (no boot sector signature). A volume that
+// exists but fails to mount is left alone: it may hold logs.
+void formatFlashIfBlank() {
+  if (blkRead(gWebBuf, 0, 1) != ESP_OK) return;
+  if (gWebBuf[510] == 0x55 && gWebBuf[511] == 0xAA) return;
+  // FAT16 superfloppy, 2 KB clusters (12.8 MB is too small for FAT32), like a small USB stick
+  MKFS_PARM opt = { FM_FAT | FM_SFD, 0, 0, 0, 2048 };
+  FRESULT fr = f_mkfs(gDrv, &opt, gWebBuf, sizeof gWebBuf);
+  klog("internal storage: first use - formatted FAT16: %s", fr == FR_OK ? "ok" : "FAILED");
+}
+
 // ------------------------------------------------------------------ setup / loop
 void setup() {
   setCpuFrequencyMhz(160);                                    // 240 is not needed; runs cooler
@@ -1896,14 +2015,17 @@ void setup() {
   setLED(128, 64, 0, 8);                                      // orange: starting
   klog("KLDongle %s starting", KLDONGLE_VERSION);
 
-  gSdOk = sdInit();
+  if (sdInit()) { gStore = STORE_SD; gBlkSectors = gCard.csd.capacity; }
+  else if (flashInit()) gStore = STORE_FLASH;
+  gSdOk = gStore != STORE_NONE;
   if (!gSdOk) {
-    klog("FATAL: no SD card");
+    klog("FATAL: no SD card and no internal storage");
     for (;;) { setLED(128, 0, 0, 20); delay(500); setLED(0, 0, 0, 0); delay(500); }
   }
   if (ff_diskio_get_drive(&gPdrv) != ESP_OK) { klog("FATAL: no free FatFs drive"); for (;;) delay(1000); }
   ff_diskio_register(gPdrv, &gDiskio);
   gDrv[0] = '0' + gPdrv;
+  if (gStore == STORE_FLASH) formatFlashIfBlank();
   clearDirtyFlag();
 
   // Before USB starts nobody else uses the card: one write window for config + IP profile.
@@ -1913,7 +2035,8 @@ void setup() {
   gLastFsWrite = millis();
   xSemaphoreGiveRecursive(gFsLock);
   gNoFs = !gFsOk;
-  if (gNoFs) klog("no FAT file system on the card - format it FAT32 (the dongle still shows up as a USB disk, so a computer can format it)");
+  if (gNoFs) klog(gStore == STORE_SD ? "no FAT file system on the card - format it FAT32 (the dongle still shows up as a USB disk, so a computer can format it)"
+                                     : "internal storage does not mount - NOT reformatting it (it may hold logs); format the USB disk from a computer");
   else loadConfig();
   ovLoad();
   gDates.begin("kl-roast-start", false);                       // new name in 1.1.0: drops 1.0.0's notes (some stale)
@@ -1931,22 +2054,23 @@ void setup() {
     }
     if (WiFi.status() == WL_CONNECTED && gFsOk) ensureIpProfile();
   } else {
-    klog("WiFi not configured - edit %s on the SD card", CONFIG_FILE);
+    klog("WiFi not configured - edit %s on the stick", CONFIG_FILE);
   }
+  if (gFsOk) collectLogs();
   finishWrite(true);
 
   MSC.vendorID("KLDongle");
-  MSC.productID("SD Stick");
+  MSC.productID("KL Stick");
   MSC.productRevision("1.0");
   MSC.onRead(mscRead);
   MSC.onWrite(mscWrite);
   MSC.onStartStop(mscStartStop);
   MSC.mediaPresent(true);
-  MSC.begin(gCard.csd.capacity, 512);
+  MSC.begin(gBlkSectors, 512);
   gUsbAttached = true;
   USB.begin();
   gUsbStarted = true;
-  klog("USB stick started (%lu sectors)", (unsigned long)gCard.csd.capacity);
+  klog("USB stick started (%lu sectors, %s)", (unsigned long)gBlkSectors, gStore == STORE_SD ? "SD card" : "internal flash");
 
   xTaskCreatePinnedToCore(sassiTask, "sassi", 12288, nullptr, 1, nullptr, 1);
 }

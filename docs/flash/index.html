@@ -30,7 +30,7 @@
 <div class="wrap">
   <header>
     <h1>KLDongle flasher</h1>
-    <p>Firmware 1.1.0 for the LILYGO T-Dongle-S3 &middot; Kaffelogic Nano 7 (older board)</p>
+    <p>Firmware 1.2.0 for the LILYGO T-Dongle-S3 &middot; Kaffelogic Nano 7 (older board)</p>
   </header>
   <main>
     <ol>
@@ -46,11 +46,10 @@
         <span slot="not-allowed">Flashing needs a secure (https) page.</span>
       </esp-web-install-button>
     </div>
-    <p>Then put a FAT32 microSD card with your Kaffelogic files in the dongle and add <code>wifi_config.txt</code>;
+    <p>Then copy your Kaffelogic stick's files onto the dongle (its internal storage, or a FAT32 microSD card) and add <code>wifi_config.txt</code>;
        see the <a href="https://github.com/henrygreenslade/kl-zero-t-dongle/tree/main/t-dongle-s3">README</a>.</p>
-    <p class="note">Your WiFi settings live on the SD card, not in the firmware, so updating never loses them.
-       &ldquo;Erase device&rdquo; on the first install only clears the dongle's own memory (roast start times).
-       Unofficial project, not affiliated with Kaffelogic.</p>
+    <p class="note">Updating only replaces the program: your profiles, logs and WiFi settings (on the SD card or in the
+       dongle's internal storage) are kept. Unofficial project, not affiliated with Kaffelogic.</p>
   </main>
 </div>
 </body>

@@ -9,19 +9,22 @@ an RGB LED. It plugs straight into the roaster. No case, no cable, no Raspberry 
   <img src="img/roaster-ip-profile.jpg" width="45%" alt="The roaster display showing the dongle's IP address as a profile name">
 </p>
 
-- **To the roaster it is a USB stick**: its microSD card holds your profiles and receives the roast logs.
+- **To the roaster it is a USB stick**: a microSD card, or the dongle's own memory if no card is inserted, holds
+  your profiles and receives the roast logs.
 - **To Kaffelogic Studio it looks like the WiFi module**: logs and profiles sync over WiFi, roasts show live, and
   profiles sent from Studio land on the card. This is a port of the Pi version's `kl-sassi`.
 - **A web page** for browsing, downloading, uploading and deleting files on the card, with a status overview.
 - **The dongle's IP address appears on the roaster** as a profile called `!ip` (right-hand photo).
 
 > **Unofficial and lightly tested.** Not affiliated with Kaffelogic. Tried on a Nano 7 with the older board (Studio
-> sync, live log of a roast). It writes to the card your roaster uses: keep a copy of your stick's files.
+> sync, live log and roast date, with an SD card and with the internal storage). It writes to the card your roaster uses: keep a copy of your stick's files.
 
 ## What you need
 
 - A **LILYGO T-Dongle-S3**. The version without a screen is the one that has been tried; the screen is not used.
-- A **microSD card**, formatted FAT32, with the contents of your Kaffelogic stick copied onto it.
+- Optionally a **microSD card** (FAT32). Without one, the dongle uses its own 16 MB flash memory: about 12.8 MB,
+  roughly 130 logs. With a card there is room for practically unlimited logs, and the card can be read in any
+  computer.
 - A computer with **Chrome or Edge** for flashing (once).
 
 ## 1. Flash the firmware
@@ -38,14 +41,19 @@ dongle and plug it in again *without* the button.
 [`docs/flash/`](../docs/flash/):
 
 ```
-esptool --chip esp32s3 write-flash 0x0 kldongle-1.1.0.bin
+esptool --chip esp32s3 write-flash 0x0 kldongle-1.2.0.bin
 ```
 
 Espressif's browser tool [esptool-js](https://espressif.github.io/esptool-js/) does the same: flash address `0x0`.
 
 **From source** (Arduino IDE): see [Building](#building-it-yourself) below.
 
-## 2. Prepare the card
+## 2. Prepare the storage
+
+**Without a card**: plug the dongle into a computer. On first start it formats its internal storage, and it then
+appears as a small USB disk: copy your stick's files onto it and add `wifi_config.txt` (step 3 below).
+
+**With a card**:
 
 1. Insert the microSD card. The slot is **inside the USB-A plug**: slide the card in label up, contacts first,
    until it sits flush with the end of the plug.
@@ -68,8 +76,12 @@ PSK=YourPassword
 # Name Kaffelogic Studio looks for (LLMNR/NetBIOS/DHCP) - leave as is unless you know why
 HOSTNAME=KaffelogicWM
 
-# Serial number shown in Studio
-SERIAL=KLDONGLE01
+# Serial number shown in Studio - default: your roaster's own, read from its logs
+# SERIAL=KLDONGLE01
+
+# Roaster firmware version reported to Studio. 9.9.9 (default) stops Studio offering
+# roaster firmware updates, which cannot be installed through the stick; log = the real version
+FIRMWARE=9.9.9
 
 # 1 = Studio and the web page may write to the card (profiles, uploads, deletes)
 # 0 = read-only: the stick never leaves the roaster
@@ -83,6 +95,10 @@ KEEPALIVE=bridge
 
 # 1 = add the roast date to each new log, like roasters with a clock do
 ROAST_DATE=1
+
+# Keep the newest N logs, removing older ones that Studio has already copied.
+# auto (default) = 100 on internal storage, keep everything on an SD card; 0 = never remove
+KEEP_LOGS=auto
 ```
 
 If the file is missing, the dongle creates a template on its first start. The file is read at power-up, so after
@@ -115,7 +131,7 @@ middle of a roast, the live view starts from the beginning of that roast.
 | cyan (teal) | Studio connected: the usual resting colour |
 | breathing orange ↔ red | roasting (the newest log is growing) |
 | yellow | writing to the card; the stick is briefly away from the roaster |
-| blinking red | no SD card, or the card is not formatted (FAT32) |
+| blinking red | storage problem: the card is not formatted (FAT32), or the internal storage does not mount |
 
 ### Good to know
 
@@ -123,7 +139,19 @@ middle of a roast, the live view starts from the beginning of that roast.
   the roaster for about a second. This is refused while the roaster is writing (i.e. roasting) and for 20 s after.
   The page then says the roaster is busy; try again after the roast. `ALLOW_WRITE=0` makes the stick never leave
   the roaster.
-- **Deleted files** go to `/kl-trash/` on the card. Deleting inside `/kl-trash/` is final.
+- **Deleted files** go to `/kl-trash/` on an SD card (deleting inside `/kl-trash/` is final). On internal storage
+  deleting is final straight away, so the trash does not use up the space.
+- **Internal storage or card**: the dongle uses the SD card if one is inserted at power-up, otherwise its internal
+  storage. They are separate: taking the card out does not copy anything across. Internal storage is formatted
+  FAT16 on first use (12.8 MB is too small for FAT32; the roaster reads it fine) and is never reformatted after
+  that, even if it fails to mount.
+- **Old logs** (`KEEP_LOGS`): on internal storage the dongle keeps the newest 100 logs. After a roast (and at
+  power-up) it removes the oldest beyond that, but only logs Studio has already downloaded. Without Studio nothing is
+  removed, and the storage can fill up: keep an eye on *Storage* on the web page.
+- **Serial number and firmware in Studio**: the dongle reports your roaster's serial number (from its logs), so
+  Studio files the logs under your roaster. Setting `SERIAL` overrides it. Note that changing the serial makes
+  Studio treat the dongle as a different roaster, with its own folder. Roaster firmware is reported as `9.9.9` so
+  Studio does not keep offering an update the stick cannot install; `FIRMWARE=log` reports the real version.
 - **Studio's *Wifi Module* tab** shows firmware `9.9.9` (so Studio considers it up to date). Do **not** use the
   *Install* links there: they are for the official module.
 - **Roast dates**: the roaster has no clock, so the dongle works out when each roast started and, when the roast
@@ -149,13 +177,16 @@ middle of a roast, the live view starts from the beginning of that roast.
 
 ## Updating
 
-Same as flashing: hold the button, plug into the computer, flash, replug. Your settings and files are on the card
-and are not affected. The firmware version is shown at the bottom of the web page.
+Same as flashing: hold the button, plug into the computer, flash, replug. Your settings and files (on the card or in
+internal storage) are not affected: updating only rewrites the program. Do not erase the whole flash with other
+tools (`esptool erase-flash`): that also wipes the internal storage. The firmware version is shown at the bottom of the web page.
 
 ## How it works
 
-- **USB stick**: TinyUSB mass storage that reads and writes the microSD card's sectors directly. The roaster sees
-  the card exactly as you formatted it.
+- **USB stick**: TinyUSB mass storage that reads and writes 512-byte sectors of the microSD card directly, or of the
+  internal `ffat` partition through ESP-IDF wear levelling. Flash is erased in 4 KB sectors, so a write is
+  read-modify-erase-write of each 4 KB sector it touches, skipped when the data is unchanged (the roaster rewrites
+  the same FAT sectors often).
 - **Reading** for Studio and the web page: a fresh FatFs mount for every operation, so nothing stale is cached while
   the roaster writes underneath. All SD access, from the roaster and from the dongle, goes through one lock, so
   commands to the card never interleave.
@@ -194,7 +225,9 @@ and are not affected. The firmware version is shown at the bottom of the web pag
 1. Arduino IDE with the **esp32** boards package by Espressif, version 3.x (built and tested with 3.3.13).
 2. Open `KLDongle/KLDongle.ino`. No extra libraries are needed.
 3. Tools menu: Board **ESP32S3 Dev Module**, USB Mode **USB-OTG (TinyUSB)**, USB CDC On Boot **Disabled**,
-   Flash Size **16MB**, Partition Scheme **16M Flash (3MB APP/9.9MB FATFS)**, PSRAM **Disabled**.
+   Flash Size **16MB**, Partition Scheme **16M Flash (3MB APP/9.9MB FATFS)**, PSRAM **Disabled**. The actual
+   partition table comes from `KLDongle/partitions.csv` (one 3 MB app, ~12.8 MB internal storage) and is used
+   automatically; the menu choice only sets the 3 MB size limit the IDE checks against.
 4. Put the dongle in download mode (button), upload, then replug it without the button.
 
 To refresh the browser flasher after a change, merge the build into one image, put it in `docs/flash/` and update

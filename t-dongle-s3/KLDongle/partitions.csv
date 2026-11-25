@@ -1,0 +1,9 @@
+# KLDongle partition table (16 MB flash). Used automatically by the Arduino IDE / arduino-cli for this sketch.
+# One app slot (no over-the-air updates) and ~12.8 MB of internal storage, used as the stick when no SD card is
+# inserted. Keep the ffat offset and size unchanged in future versions: moving it would lose what is stored there.
+# Name,   Type, SubType,  Offset,   Size,
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xe000,   0x2000,
+app0,     app,  ota_0,    0x10000,  0x300000,
+ffat,     data, fat,      0x310000, 0xCE0000,
+coredump, data, coredump, 0xFF0000, 0x10000,

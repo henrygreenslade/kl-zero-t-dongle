@@ -95,7 +95,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
     <div class="stat"><div class="k">Roaster</div><div class="v" id="sRoaster">&ndash;</div><div class="s" id="sRoaster2">&nbsp;</div></div>
     <div class="stat"><div class="k">Stick</div><div class="v" id="sStick">&ndash;</div><div class="s" id="sStick2">&nbsp;</div></div>
     <div class="stat"><div class="k">Studio</div><div class="v" id="sStudio">&ndash;</div><div class="s" id="sStudio2">&nbsp;</div></div>
-    <div class="stat"><div class="k">Card</div><div class="v" id="sCard">&ndash;</div><div class="s" id="sCard2">&nbsp;</div></div>
+    <div class="stat"><div class="k">Storage</div><div class="v" id="sCard">&ndash;</div><div class="s" id="sCard2">&nbsp;</div></div>
   </div>
 
   <div class="toolbar">
@@ -147,8 +147,10 @@ function setStat(id, text, sub, dot) {
   $(id + '2').textContent = sub || ' ';
 }
 
+let lastStatus = {};
 function refreshStatus() {
   fetch('/status').then(r => r.json()).then(s => {
+    lastStatus = s;
     $('ver').textContent = 'KLDongle ' + s.version;
     $('net').textContent = s.ip + ' · ' + s.hostname + ' · ' + s.rssi + ' dBm';
     if (s.live) setStat('sRoaster', 'Roasting', s.live, 'roast');
@@ -156,7 +158,7 @@ function refreshStatus() {
     if (s.writeWindow) setStat('sStick', 'Away (writing)', 'back in a moment', 'warn');
     else setStat('sStick', s.usbAttached ? 'With the roaster' : 'Detached', s.allowWrite ? 'Writes allowed' : 'Read-only (ALLOW_WRITE=0)', s.usbAttached ? 'on' : 'bad');
     setStat('sStudio', s.studio ? 'Connected' : 'Not connected', s.studio ? s.studioPeer : '', s.studio ? 'on' : '');
-    if (s.size) setStat('sCard', formatBytes(s.size - s.used) + ' free', formatBytes(s.used) + ' used of ' + formatBytes(s.size));
+    if (s.size) setStat('sCard', formatBytes(s.size - s.used) + ' free', s.storage + ' \u00b7 ' + formatBytes(s.used) + ' of ' + formatBytes(s.size) + ' used');
   }).catch(() => {});
 }
 
@@ -169,7 +171,7 @@ function updateCrumbs() {
     c.appendChild(a);
   };
   const parts = currentPath.split('/').filter(x => x);
-  add('Card', '/', parts.length === 0);
+  add('Stick', '/', parts.length === 0);
   let p = '';
   parts.forEach((part, i) => {
     p += '/' + part;
@@ -220,7 +222,8 @@ function refreshFiles() {
 }
 
 function deleteFile(path) {
-  if (!confirm('Delete ' + path + '?\n\nFiles are moved to /kl-trash; deleting inside /kl-trash is final.')) return;
+  const note = lastStatus.storage === 'internal flash' ? 'This cannot be undone.' : 'Files are moved to /kl-trash; deleting inside /kl-trash is final.';
+  if (!confirm('Delete ' + path + '?\n\n' + note)) return;
   fetch('/delete?file=' + encodeURIComponent(path), { method: 'DELETE' })
     .then(r => r.text().then(t => { msg(r.ok ? '' : t); refreshFiles(); refreshStatus(); }));
 }

@@ -41,7 +41,7 @@ dongle and plug it in again *without* the button.
 [`docs/flash/`](../docs/flash/):
 
 ```
-esptool --chip esp32s3 write-flash 0x0 kldongle-1.2.0.bin
+esptool --chip esp32s3 write-flash 0x0 kldongle-1.3.0.bin
 ```
 
 Espressif's browser tool [esptool-js](https://espressif.github.io/esptool-js/) does the same: flash address `0x0`.
@@ -139,6 +139,11 @@ middle of a roast, the live view starts from the beginning of that roast.
   the roaster for about a second. This is refused while the roaster is writing (i.e. roasting) and for 20 s after.
   The page then says the roaster is busy; try again after the roast. `ALLOW_WRITE=0` makes the stick never leave
   the roaster.
+- **Marking colour change and cracks in Studio** works during a live roast: Studio shows the mark straight away,
+  and after the roast it is written into the log, just as a roaster with WiFi does it (`!first_crack:425.467`,
+  placed where it was marked, timed 8.5 s before the click like the roaster does). With first crack marked, the log
+  also gets `!development_percent`. The roaster's own display does not show the marks. *End roast* from Studio is
+  refused: the old roaster cannot receive commands through the stick, so end the roast on the roaster.
 - **Deleted files** go to `/kl-trash/` on an SD card (deleting inside `/kl-trash/` is final). On internal storage
   deleting is final straight away, so the trash does not use up the space.
 - **Internal storage or card**: the dongle uses the SD card if one is inserted at power-up, otherwise its internal
@@ -204,6 +209,13 @@ tools (`esptool erase-flash`): that also wipes the internal storage. The firmwar
   [docs/PROTOCOL.md](../docs/PROTOCOL.md)). The dongle answers LLMNR and NetBIOS queries for `KaffelogicWM` and
   registers that name as its DHCP host name. Files Studio pushes outside the profile folder (such as
   `last_connection_uuid`) are kept in the dongle's flash, never on the card. Firmware files are refused.
+- **Marks from Studio** (SASSI ACTION 102, data 0-4 = colour change, first crack, first crack end, second crack,
+  second crack end): acknowledged like the roaster does (Studio only offers marking when the system info reports `features:1`,
+  as roasters with live control do), echoed as `!<event>:<seconds>` in the live stream right after the next data
+  line (one line per packet, no newline, as the roaster streams), kept in
+  RAM and written into the log in the end-of-roast rewrite. Their time is the click's log time minus 8.5 s (measured
+  on a roaster with WiFi: 8.49 s, constant), placed after the data line current at the click; checked against a real
+  log by rebuilding it from a stripped copy. ACTION 103 (end roast) is refused.
 - **`!ip` profile**: written once WiFi is up, only when the address changed, and hidden from Studio.
 - **`roast_date`**: once the newest log has not grown for 5 s *and* the roaster has made no USB write for 5 s, the
   log is copied with the line inserted before `time_jump:` and swapped in by renames (the roaster's file date is

@@ -59,7 +59,7 @@ extern "C" {          // same include order as the core's SD library (sd_diskio.
 #include "mbedtls/base64.h"
 #include "webui.h"
 
-#define KLDONGLE_VERSION "1.2.0"
+#define KLDONGLE_VERSION "1.3.0"
 
 // ------------------------------------------------------------------ T-Dongle-S3 pins
 #define PIN_SD_CLK 12
@@ -106,7 +106,7 @@ enum { OC_OK = 0, OC_NOT_VALID = 2, OC_NOT_FOUND = 3, OC_SYS_ERR = 4, OC_DENIED 
 // info codes
 enum { INFO_FOLDER_UPDATED = 1, INFO_SYSTEM = 3, INFO_FILESYS = 4, INFO_BUSY = 6, INFO_NOT_BUSY = 7,
        INFO_OPSTATUS = 9, INFO_BRIDGE_STATUS = 100 };
-enum { ACT_CONN_CONTROL = 4, ACT_FS_CLEANUP = 110 };
+enum { ACT_CONN_CONTROL = 4, ACT_MARK_EVENT = 102, ACT_END_ROAST = 103, ACT_FS_CLEANUP = 110 };
 
 // ------------------------------------------------------------------ types
 struct Config {
@@ -192,6 +192,18 @@ static char gLiveName[32] = "";
 // Roast detector: a roast is running while the newest logNNNN.klog grows (or a newer one appears).
 static volatile bool gRoasting = false;
 static char gRoastName[32] = "";
+// Marks from Studio during a live roast (ACTION 102). The roaster records each mark 8.5 s before the click
+// (measured: 8.49 s, constant) and writes it after the data line that was current when it was clicked.
+struct RoastMark { uint8_t kind; float clickT; };   // clickT = log time of the click
+static const char* MARK_NAMES[] = { "colour_change", "first_crack", "first_crack_end", "second_crack", "second_crack_end" };
+static const float MARK_BACKDATE_S = 8.5f;
+static const int MAX_MARKS = 64;
+static RoastMark gMarks[MAX_MARKS];
+static volatile int gMarkCount = 0;
+static char gMarksFor[32] = "";
+static portMUX_TYPE gMarkMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile float gLiveLastT = -1;          // newest data line in the live log, and when the dongle first saw it
+static volatile uint32_t gLiveLastMs = 0;
 static volatile uint32_t gRoastLastGrow = 0;
 static String gPendName;                     // roast whose start is known only against uptime (no clock yet)
 static uint32_t gPendStartMs = 0;
@@ -206,6 +218,7 @@ static size_t gRxLen = 0;
 static uint8_t gChunk[6144];
 static char gB64[8400];
 static uint8_t gWebBuf[4096];
+static uint8_t gLineBuf[2048];       // live log: new lines, sent one per packet
 
 // ------------------------------------------------------------------ logging (RAM ring, shown at /log)
 bool timeValid() { return time(nullptr) > 1700000000; }
@@ -936,6 +949,7 @@ class Session {
   String livePath;
   uint32_t liveSent = 0;
   uint32_t liveAt = 0;
+  std::vector<String> pendingEcho;    // marks to echo, sent right after the next data line (the roaster's order)
 
   Session(WiFiClient& cl, const String& p) : c(cl), peer(p) { t0 = millis(); gRxLen = 0; }
 
@@ -1076,7 +1090,8 @@ class Session {
       // Default 9.9.9: newer than any release, so Studio stops offering roaster firmware updates (which cannot
       // be installed through the stick). FIRMWARE=log reports the version from the newest klog.
       String fw = cfg.firmware == "log" ? firmwareVersion() : cfg.firmware;
-      String r = "model:Nano 7;serial:" + cfg.serial;
+      // features:1 as roasters with live control report it (Studio enables marking colour change / cracks with it)
+      String r = "model:Nano 7;features:1;serial:" + cfg.serial;
       if (fw.length()) r += ";firmware:" + fw;
       return r;
     }
@@ -1206,7 +1221,11 @@ class Session {
       int code = g(3).toInt();
       if (code == ACT_FS_CLEANUP) send(T_ACTION_ACK, { "0", String(OC_OK), "" });
       else if (code == ACT_CONN_CONTROL) send(T_ACTION_ACK, { g(2), String(OC_OK), "" });
-      else {
+      else if (code == ACT_MARK_EVENT) markEvent(g(2));
+      else if (code == ACT_END_ROAST) {
+        klog("Studio asked to end the roast - not possible: the roaster cannot receive commands through the stick");
+        send(T_ACTION_ACK, { g(2), String(OC_DENIED), cfg.serial });
+      } else {
         klog("ACTION %d data=%s -> denied (not implemented)", code, g(2).c_str());
         send(T_ACTION_ACK, { g(2), String(OC_DENIED), "" });
       }
@@ -1221,6 +1240,49 @@ class Session {
     }
   }
 
+  // A mark from Studio (colour change, first crack, ...). The roaster cannot be told, so the dongle answers like it
+  // does: records the mark, echoes "!first_crack:<s>" in the live stream (Studio draws it), and writes it into the
+  // log once the roast is over (rewriteFinishedLog).
+  void markEvent(const String& data) {
+    int k = data.toInt();
+    bool okKind = data.length() == 1 && k >= 0 && k < (int)(sizeof MARK_NAMES / sizeof MARK_NAMES[0]);
+    if (!okKind || !live || !gRoasting || gLiveLastT < 0) {
+      klog("mark %s refused: %s", data.c_str(), okKind ? "no live roast" : "unknown mark");
+      send(T_ACTION_ACK, { data, String(OC_DENIED), cfg.serial });
+      return;
+    }
+    // log time now: newest data line + time since the dongle saw it + ~0.5 s it was already old when seen
+    float clickT = gLiveLastT + 0.5f + (millis() - gLiveLastMs) / 1000.0f;
+    float t = clickT - MARK_BACKDATE_S;
+    if (t < 0) t = 0;
+    bool stored = false;
+    portENTER_CRITICAL(&gMarkMux);
+    if (gMarkCount < MAX_MARKS) {
+      gMarks[gMarkCount].kind = (uint8_t)k;
+      gMarks[gMarkCount].clickT = clickT;
+      gMarkCount = gMarkCount + 1;
+      stored = true;
+    }
+    portEXIT_CRITICAL(&gMarkMux);
+    if (!stored) klog("mark %s: %d marks already, not stored in the log", MARK_NAMES[k], MAX_MARKS);
+    send(T_ACTION_ACK, { data, String(OC_OK), cfg.serial });
+    char line[48];
+    int n = snprintf(line, sizeof line, "!%s:%.3f", MARK_NAMES[k], t);   // no newline: one line per packet, like the roaster
+    klog("mark %s (clicked at %.1f s)", line, clickT);
+    pendingEcho.push_back(String(line));   // the roaster sends it after the next data line, not with the ack
+  }
+
+  void sendEchoes(const String& path) {
+    String dt = timeValid() ? sassiDt(time(nullptr)) : String("");
+    for (auto& e : pendingEcho) {
+      String line = e;
+      sendMulti(T_NOTIFY_FILE, path, line.length(), [&](uint32_t off, uint8_t* buf, size_t len) -> int {
+        memcpy(buf, line.c_str() + off, len); return (int)len;
+      }, [&](int oc, int seq, const String& b) -> Fields { return { path, String(oc), dt, String(seq), b }; });
+    }
+    pendingEcho.clear();
+  }
+
   // Live log: the roaster writes the klog incrementally (1 line/s). BUSY, then NOTIFY_FILE with the whole file so
   // far (starts with log_file_name:), then only new complete lines. 20 s without writes: NOT_BUSY with the path.
   void liveTick() {
@@ -1228,6 +1290,7 @@ class Session {
     liveAt = millis();
     if (!gRoasting) {
       if (live) {
+        if (!pendingEcho.empty()) sendEchoes(livePath);
         klog("live: end %s (%lu bytes sent)", livePath.c_str(), (unsigned long)liveSent);
         send(T_NOTIFY_STATUS, { livePath, String(INFO_NOT_BUSY) });
         live = false;
@@ -1261,6 +1324,19 @@ class Session {
       }
       pos += br;
     }
+    if (lastNl > 0) {                                          // newest data line: for timing marks from Studio
+      uint32_t s0 = lastNl > 200 ? (uint32_t)lastNl - 200 : 0;
+      UINT br = 0;
+      if (f_lseek(&gSassiFil, s0) == FR_OK && f_read(&gSassiFil, gChunk, (UINT)(lastNl - s0), &br) == FR_OK) {
+        gChunk[br] = 0;
+        char* ls = strrchr((char*)gChunk, '\n');
+        ls = ls ? ls + 1 : (char*)gChunk;
+        if (isdigit((unsigned char)*ls)) {
+          float t = atof(ls);
+          if (t > gLiveLastT) { gLiveLastT = t; gLiveLastMs = millis(); }
+        }
+      }
+    }
     f_close(&gSassiFil);
     if (!same) {
       klog("live: start %s", path.c_str());
@@ -1273,9 +1349,30 @@ class Session {
     if (lastNl < 0) return;
     uint32_t end = (uint32_t)lastNl + 1;
     if (end <= liveSent || (firstNul >= 0 && firstNul < (int64_t)end)) return;
-    if (sendFile(T_NOTIFY_FILE, path, liveSent, end - liveSent,
-                 [&](int oc, int seq, const String& b) -> Fields { return { path, String(oc), "", String(seq), b }; }))
-      liveSent = end;
+    String dt = timeValid() ? sassiDt(time(nullptr)) : String("");
+    Mk mk = [&](int oc, int seq, const String& b) -> Fields { return { path, String(oc), dt, String(seq), b }; };
+    uint32_t len = end - liveSent;
+    if (liveSent == 0 || len > sizeof gLineBuf) {               // initial dump (or a big catch-up): one transfer
+      if (sendFile(T_NOTIFY_FILE, path, liveSent, len, mk)) liveSent = end;
+      return;
+    }
+    // new lines: one packet per line, without the newline - exactly as the roaster streams them
+    if (f_open(&gSassiFil, fp(path).c_str(), FA_READ) != FR_OK) return;
+    UINT br = 0;
+    bool rd = f_lseek(&gSassiFil, liveSent) == FR_OK && f_read(&gSassiFil, gLineBuf, len, &br) == FR_OK && br == len;
+    f_close(&gSassiFil);
+    if (!rd) return;
+    uint32_t a = 0;
+    for (uint32_t i = 0; i < len; i++) {
+      if (gLineBuf[i] != '\n') continue;
+      uint32_t n = i - a;
+      const uint8_t* lp = gLineBuf + a;
+      if (n && !sendMulti(T_NOTIFY_FILE, path, n, [&](uint32_t off, uint8_t* buf, size_t m) -> int {
+            memcpy(buf, lp + off, m); return (int)m; }, mk)) return;
+      liveSent += i + 1 - a;
+      a = i + 1;
+    }
+    if (!pendingEcho.empty()) sendEchoes(path);
   }
 
   uint64_t dirSignature() {
@@ -1422,7 +1519,7 @@ long logNumber(const String& name) {
 
 void recordRoastDate(const String& name);
 void collectLogs();
-int insertRoastDate(const String& name, uint32_t& newSize);
+int rewriteFinishedLog(const String& name, uint32_t& newSize);
 
 // About once a second. The roaster appends a line per second to the newest log while roasting and cooling, so
 // "the newest log grew, or a newer log appeared" = roasting. Only scans while the USB host is writing (or a roast
@@ -1451,6 +1548,11 @@ void roastTick() {
           strncpy(gRoastName, name.c_str(), sizeof gRoastName - 1);
           gRoasting = true;
           klog("roast detected: %s is growing", name.c_str());
+          portENTER_CRITICAL(&gMarkMux);
+          gMarkCount = 0;
+          strncpy(gMarksFor, name.c_str(), sizeof gMarksFor - 1);
+          portEXIT_CRITICAL(&gMarkMux);
+          gLiveLastT = -1;
           // A new roast: any note under this name belongs to an older, deleted log (the roaster reuses numbers).
           if (gDates.isKey(name.c_str())) gDates.remove(name.c_str());
           if (gPendName == name) gPendName = "";
@@ -1469,7 +1571,7 @@ void roastTick() {
       if (hostBusy(ROAST_IDLE_MS)) return;                    // roaster still writing (closing the file): wait
       resolvePendingRoastDate();
       uint32_t newSize = 0;
-      int r = insertRoastDate(gRoastName, newSize);
+      int r = rewriteFinishedLog(gRoastName, newSize);
       if (r == OC_BUSY) return;                               // try again next tick
       datedName = gRoastName;
       if (r == OC_OK && newSize && seenName == gRoastName) seenSize = newSize;   // our own change is not "growth"
@@ -1480,61 +1582,144 @@ void roastTick() {
   }
 }
 
-// Add "roast_date:DD/MM/YYYY HH:MM:SS UTC" to the header of a finished log, before "time_jump:" - where roasters
-// with a clock write it - so Studio shows the roast date. The file is rewritten to a tmp file and swapped in by
-// renames; the roaster's own file date is kept. OC_OK = added, OC_BUSY = try later, anything else = skipped.
-int insertRoastDate(const String& name, uint32_t& newSize) {
-  if (!cfg.roastDate || !cfg.allowWrite || name.length() > 15) return OC_DENIED;
-  uint32_t start = gDates.getUInt(name.c_str(), 0);
-  if (!start) return OC_NOT_FOUND;                            // start time unknown (no clock during the roast)
+// Finish a log the way a roaster with a clock (and marks from Studio) would have written it:
+//  - "roast_date:DD/MM/YYYY HH:MM:SS UTC" in the header, before "time_jump:" (roast start)
+//  - each mark "!first_crack:<s>" after the data line that was current when it was clicked
+//  - "!development_percent:<%>" after "!roast_end:" when first crack was marked
+//  - "!roast_date:<end time>" after the end-of-roast "!..." block
+// Read-only scan for the insertion points, then one copy to a tmp file swapped in by renames; the roaster's own
+// file date is kept. OC_OK = rewritten, OC_BUSY = try later, anything else = nothing to do / skipped.
+struct LogInsert { uint32_t at; char text[64]; };
+
+static String fmtUtc(uint32_t t) {
+  int y; unsigned mo, d;
+  civilFromDays(t / 86400, y, mo, d);
+  uint32_t sec = t % 86400;
+  char b[32];
+  snprintf(b, sizeof b, "%02u/%02u/%04d %02lu:%02lu:%02lu UTC", d, mo, y,
+           (unsigned long)(sec / 3600), (unsigned long)((sec / 60) % 60), (unsigned long)(sec % 60));
+  return String(b);
+}
+
+int rewriteFinishedLog(const String& name, uint32_t& newSize) {
+  if (!cfg.allowWrite || name.length() > 15) return OC_DENIED;
+  static RoastMark marks[MAX_MARKS];
+  int nm = 0;
+  portENTER_CRITICAL(&gMarkMux);
+  if (name == gMarksFor) { nm = gMarkCount; memcpy(marks, gMarks, sizeof(RoastMark) * nm); }
+  portEXIT_CRITICAL(&gMarkMux);
+  uint32_t start = cfg.roastDate ? gDates.getUInt(name.c_str(), 0) : 0;
+  if (!start && !nm) return OC_NOT_FOUND;
   String rel = String(LOG_DIR) + "/" + name, tmp = rel + ".tmp~", old = rel + ".old~";
   FsUse u;
   if (!u.ok) return OC_SYS_ERR;
-  // Look at the header first (read-only): already dated? where to insert?
-  if (f_open(&gWrFil, fp(rel).c_str(), FA_READ) != FR_OK) return OC_NOT_FOUND;
-  UINT br = 0;
-  f_read(&gWrFil, gWebBuf, sizeof gWebBuf - 1, &br);
-  f_close(&gWrFil);
-  gWebBuf[br] = 0;
-  const char* head = (const char*)gWebBuf;
-  if (strncmp(head, "log_file_name:", 14) != 0 || strstr(head, "\nroast_date:")) return OC_DENIED;
-  const char* at = strstr(head, "\ntime_jump:");
-  if (!at) at = strstr(head, "\noffsets");
-  if (!at) return OC_DENIED;
-  uint32_t insertAt = (uint32_t)(at - head) + 1;              // start of that line
 
+  // 1. scan (read-only)
+  if (f_open(&gWrFil, fp(rel).c_str(), FA_READ) != FR_OK) return OC_NOT_FOUND;
+  uint32_t fsize = f_size(&gWrFil);
+  if (f_size(&gWrFil) < 14) { f_close(&gWrFil); return OC_DENIED; }
+  bool inData = false, hasDate = false, hasDev = false, hasEndDate = false, inBlock = false, firstLine = true, okHead = false;
+  int64_t headerAt = -1, roastEndLineEnd = -1, blockEnd = -1;
+  float roastEnd = -1, afterBlockT = -1, lastDataT = -1;
+  static int64_t markAt[MAX_MARKS];
+  for (int i = 0; i < nm; i++) markAt[i] = -1;
+  char pre[64];
+  int pl = 0;
+  uint32_t lineStart = 0, pos = 0;
+  UINT br = 0;
+  while (f_read(&gWrFil, gWebBuf, sizeof gWebBuf, &br) == FR_OK && br > 0) {
+    for (UINT i = 0; i < br; i++, pos++) {
+      char ch = (char)gWebBuf[i];
+      if (ch != '\n') { if (pl < (int)sizeof pre - 1) pre[pl++] = ch; continue; }
+      pre[pl] = 0;
+      uint32_t lineEnd = pos + 1;
+      if (firstLine) { okHead = strncmp(pre, "log_file_name:", 14) == 0; firstLine = false; }
+      if (!inData) {
+        if (!strncmp(pre, "roast_date:", 11)) hasDate = true;
+        else if (!strncmp(pre, "time_jump:", 10) && headerAt < 0) headerAt = lineStart;
+        else if (!strncmp(pre, "offsets", 7) && headerAt < 0) headerAt = lineStart;
+        else if (!strncmp(pre, "time\t", 5)) inData = true;
+      } else if (pre[0] == '!') {
+        if (!strncmp(pre, "!roast_end:", 11)) {               // the last one counts (an early abort can log one too)
+          roastEnd = atof(pre + 11); roastEndLineEnd = lineEnd; inBlock = true; afterBlockT = -1;
+          hasDev = false; hasEndDate = false;
+        }
+        if (!strncmp(pre, "!development_percent:", 21)) hasDev = true;
+        if (!strncmp(pre, "!roast_date:", 12)) hasEndDate = true;
+        if (inBlock) blockEnd = lineEnd;
+      } else if (isdigit((unsigned char)pre[0]) || pre[0] == '-') {
+        float t = atof(pre);
+        if (inBlock) { inBlock = false; if (afterBlockT < 0) afterBlockT = t; }
+        for (int m = 0; m < nm; m++) if (markAt[m] < 0 && t >= marks[m].clickT) markAt[m] = lineEnd;
+        lastDataT = t;
+      } else {
+        inBlock = false;
+      }
+      pl = 0;
+      lineStart = lineEnd;
+    }
+  }
+  f_close(&gWrFil);
+  if (!okHead || !inData) return OC_DENIED;
+
+  static LogInsert ins[MAX_MARKS + 8];
+  int ni = 0;
+  if (start && !hasDate && headerAt >= 0) {
+    ins[ni].at = headerAt;
+    snprintf(ins[ni].text, sizeof ins[ni].text, "roast_date:%s\n", fmtUtc(start).c_str());
+    ni++;
+  }
+  float firstCrack = -1;
+  for (int m = 0; m < nm && ni < MAX_MARKS + 6; m++) {
+    float t = marks[m].clickT - MARK_BACKDATE_S;
+    if (t < 0) t = 0;
+    if (marks[m].kind == 1 && firstCrack < 0) firstCrack = t;
+    ins[ni].at = markAt[m] >= 0 ? (uint32_t)markAt[m] : fsize;
+    snprintf(ins[ni].text, sizeof ins[ni].text, "!%s:%.3f\n", MARK_NAMES[marks[m].kind], t);
+    ni++;
+  }
+  if (roastEndLineEnd >= 0 && !hasDev && firstCrack >= 0 && roastEnd > firstCrack) {
+    ins[ni].at = roastEndLineEnd;
+    snprintf(ins[ni].text, sizeof ins[ni].text, "!development_percent:%.4f\n", (roastEnd - firstCrack) / roastEnd * 100.0f);
+    ni++;
+  }
+  if (start && blockEnd >= 0 && !hasEndDate) {
+    float tEnd = afterBlockT >= 0 ? afterBlockT : lastDataT + 1;
+    ins[ni].at = blockEnd;
+    snprintf(ins[ni].text, sizeof ins[ni].text, "!roast_date:%s\n", fmtUtc(start + (uint32_t)(tEnd + 0.5f)).c_str());
+    ni++;
+  }
+  if (!ni) return OC_DENIED;
+  // stable sort by position (equal positions keep their order)
+  for (int i = 1; i < ni; i++)
+    for (int j = i; j > 0 && ins[j - 1].at > ins[j].at; j--) { LogInsert x = ins[j]; ins[j] = ins[j - 1]; ins[j - 1] = x; }
+
+  // 2. copy with the insertions
   int r = beginWriteQuiet(ROAST_IDLE_MS);                     // the roaster has been quiet for 5 s
   if (r != OC_OK) return r;
   gLastFsWrite = millis();
   FILINFO orig;
   if (f_stat(fp(rel).c_str(), &orig) != FR_OK) return OC_NOT_FOUND;
-  int64_t days = start / 86400;
-  int y; unsigned mo, d;
-  civilFromDays(days, y, mo, d);
-  uint32_t sec = start % 86400;
-  char line[48];
-  int ll = snprintf(line, sizeof line, "roast_date:%02u/%02u/%04d %02lu:%02lu:%02lu UTC\n", d, mo, y,
-                    (unsigned long)(sec / 3600), (unsigned long)((sec / 60) % 60), (unsigned long)(sec % 60));
   bool ok = f_open(&gWrFil, fp(rel).c_str(), FA_READ) == FR_OK;
   if (ok && f_open(&gTmpFil, fp(tmp).c_str(), FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) { f_close(&gWrFil); ok = false; }
   if (ok) {
     UINT bw;
-    uint32_t pos = 0;
-    bool inserted = false;
+    uint32_t p = 0;
+    int next = 0;
     while (ok) {
-      UINT want = sizeof gWebBuf;
-      if (!inserted && insertAt - pos < want) want = insertAt - pos;
-      if (want == 0 && !inserted) {
-        ok = f_write(&gTmpFil, line, ll, &bw) == FR_OK && bw == (UINT)ll;
-        inserted = true;
-        continue;
+      while (ok && next < ni && ins[next].at == p) {
+        UINT l = strlen(ins[next].text);
+        ok = f_write(&gTmpFil, ins[next].text, l, &bw) == FR_OK && bw == l;
+        next++;
       }
+      UINT want = sizeof gWebBuf;
+      if (next < ni && ins[next].at - p < want) want = ins[next].at - p;
       if (f_read(&gWrFil, gWebBuf, want, &br) != FR_OK) { ok = false; break; }
       if (br == 0) break;
       ok = f_write(&gTmpFil, gWebBuf, br, &bw) == FR_OK && bw == br;
-      pos += br;
+      p += br;
     }
-    ok = ok && inserted;
+    ok = ok && next == ni;
     f_close(&gWrFil);
     newSize = f_size(&gTmpFil);
     if (f_close(&gTmpFil) != FR_OK) ok = false;
@@ -1552,8 +1737,13 @@ int insertRoastDate(const String& name, uint32_t& newSize) {
   }
   if (!ok) f_unlink(fp(tmp).c_str());
   gLastFsWrite = millis();
-  klog("roast_date %.*s -> %s %s", ll - 12, line + 11, name.c_str(), ok ? "added" : "FAILED (log unchanged)");
-  if (ok) gDates.remove(name.c_str());                         // the date now lives in the log
+  for (int i = 0; i < ni; i++) {
+    String t = ins[i].text;
+    t.trim();
+    klog("%s: %s %s", name.c_str(), t.c_str(), ok ? "added" : "NOT added");
+  }
+  if (!ok) klog("%s: rewrite FAILED - log unchanged", name.c_str());
+  if (ok && start && !hasDate) gDates.remove(name.c_str());    // the date now lives in the log
   return ok ? OC_OK : OC_CANNOT_SAVE;
 }
 

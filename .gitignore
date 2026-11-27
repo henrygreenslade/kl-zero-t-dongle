@@ -7,3 +7,4 @@ __pycache__/
 USBESPKL*
 .DS_Store
 !docs/flash/*.bin
+conlog*.txt
